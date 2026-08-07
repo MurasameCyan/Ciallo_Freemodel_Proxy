@@ -167,10 +167,10 @@ async fn recording_upstream() -> (String, RecordedRequest) {
 #[tokio::test]
 async fn direct_nonstreaming_uses_configured_upstream_auth_and_converts_responses() {
     let (base, recorded) = recording_upstream().await;
-    let (_root, mut state) = direct_state(&base);
-    let mut config = (*state.config).clone();
-    config.api_key = "configured-upstream-key".into();
-    state.config = std::sync::Arc::new(config);
+    let (_root, state) = direct_state(&base);
+    // 换 key 走 AppState 的接口。直接替换 state.config 是不够的：上游 key 另有一份
+    // 可写副本（Web 设定页要热更新它），换 config 不会动到那份。
+    state.set_upstream_key("configured-upstream-key").unwrap();
     let default_project = state.config.default_project.to_string_lossy().to_string();
     let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
