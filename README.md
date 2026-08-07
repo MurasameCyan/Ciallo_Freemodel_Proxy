@@ -57,7 +57,9 @@ Copy-Item .env.example .env
 Docker Compose up -d
 ```
 
-也可以先不填 key，启动后再写（存进 `/data` 卷，容器重建不丢）：
+也可以先不填 key，启动后打开 **<http://127.0.0.1:40589/setup>** 在浏览器里填：那个页面能存 Freemodel key、显示该抄给客户端的反代地址、列出可用模型。保存立即生效，不用重启；key 同时写进 `/data` 卷，容器重建不丢。
+
+命令行等价物：
 
 ```bash
 docker exec -it freemodel-proxy freemodel-workbuddy-proxy key set
@@ -79,7 +81,7 @@ docker run -d --name freemodel-proxy \
 
 镜像是多架构的（`linux/amd64` + `linux/arm64`），Apple Silicon、树莓派、Ampere/Graviton 云主机直接 pull 就是原生版本，不需要 `--platform`，也不走 QEMU 模拟。要是看到 `The requested image's platform (linux/amd64) does not match the detected host platform`，那是本地缓存着早期的单架构镜像，`docker compose pull` 重拉一次即可（详见 [DOCKER.md](DOCKER.md#故障排查)）。
 
-客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。Anthropic 客户端同样填这个地址，它会自己拼出 `/v1/messages`；Claude Code 用 `ANTHROPIC_BASE_URL=http://127.0.0.1:40589` 加 `ANTHROPIC_AUTH_TOKEN=$PROXY_API_KEY`。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试，每次重试前退避 2/4/6 秒——这个池是网关级上限，换 model 不腾实例，真正管用的是等一会儿。
+客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。不确定该抄哪个地址就打开 `/setup`，它按你当前访问的域名/端口现算，还带复制按钮。Anthropic 客户端同样填这个地址，它会自己拼出 `/v1/messages`；Claude Code 用 `ANTHROPIC_BASE_URL=http://127.0.0.1:40589` 加 `ANTHROPIC_AUTH_TOKEN=$PROXY_API_KEY`。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试，每次重试前退避 2/4/6 秒——这个池是网关级上限，换 model 不腾实例，真正管用的是等一会儿。
 
 每次响应都带 `usage`（含 `cached_tokens`），用它核对真实消耗。
 

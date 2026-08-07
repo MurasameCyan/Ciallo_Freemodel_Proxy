@@ -1,0 +1,188 @@
+<!doctype html>
+<!-- 由 src/server.rs 的 include_str! 编译进二进制：容器里没有静态目录，也不该有。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Freemodel 代理设定</title>
+<style>
+  :root { color-scheme: light dark; --line: #8883; --bad: #c0392b; --good: #1e7a45; }
+  @media (prefers-color-scheme: dark) { :root { --bad: #ff8a80; --good: #7ee2a8; } }
+  body { font: 15px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+         max-width: 46rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+  h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; }
+  p.hint { margin: .25rem 0 1rem; opacity: .75; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin: 0 0 1rem; }
+  legend { padding: 0 .4rem; font-weight: 600; }
+  label { display: block; font-weight: 600; margin-top: .75rem; }
+  input { width: 100%; box-sizing: border-box; padding: .5rem; margin-top: .25rem;
+          font: inherit; font-family: ui-monospace, Consolas, monospace;
+          border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .45rem .9rem; margin-top: .75rem; cursor: pointer;
+           border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+  button:hover { border-color: currentColor; }
+  :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  .row { display: flex; gap: .5rem; align-items: flex-end; }
+  .row input { flex: 1; }
+  .row button { flex: none; margin-top: 0; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; margin: 0; }
+  dd { margin: 0; font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+  .msg { margin-top: .75rem; min-height: 1.6em; }
+  .msg.err { color: var(--bad); }
+  .msg.ok { color: var(--good); }
+  code { font-family: ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<h1>Freemodel 代理设定</h1>
+<p class="hint">这个页面只跟本代理说话，不会把任何东西发到别处。</p>
+
+<h2>反代地址</h2>
+<p class="hint">直接填进客户端的 base URL。地址取自你当前浏览器栏，所以经域名或反向代理访问时显示的也是对的那个。</p>
+<div class="row">
+  <label for="base">OpenAI 兼容 base URL
+    <input id="base" readonly value="…">
+  </label>
+  <button type="button" data-copy="base">复制</button>
+</div>
+<div class="row">
+  <label for="anthropic">Anthropic base URL（Claude Code / Anthropic SDK）
+    <input id="anthropic" readonly value="…">
+  </label>
+  <button type="button" data-copy="anthropic">复制</button>
+</div>
+<p class="msg" id="copy-msg" role="status" aria-live="polite"></p>
+
+<h2>凭据</h2>
+<form id="form">
+  <fieldset>
+    <legend>代理自调用 key</legend>
+    <p class="hint">就是 <code>PROXY_API_KEY</code>，客户端调 <code>/v1/*</code> 用的那把，也是这个页面读写设定的凭据。
+      它由 <code>.env</code> 提供，本页只用不改。没设置过就留空。<strong>不会被保存在浏览器里</strong>，刷新后需重填。</p>
+    <label for="proxy-key">代理自调用 key
+      <input id="proxy-key" type="password" autocomplete="off" spellcheck="false" placeholder="留空表示未启用鉴权">
+    </label>
+    <button type="button" id="refresh">读取当前状态</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Freemodel key</legend>
+    <p class="hint">上游 <code>fe_</code> 开头的那把。保存即生效，不用重启容器；同时写入 <code>/data/config.json</code>，容器重建也不丢。</p>
+    <label for="freemodel-key">Freemodel key
+      <input id="freemodel-key" type="password" autocomplete="off" spellcheck="false" placeholder="fe_...">
+    </label>
+    <button type="submit">保存</button>
+  </fieldset>
+</form>
+<p class="msg" id="save-msg" role="status" aria-live="polite"></p>
+
+<h2>当前状态</h2>
+<dl>
+  <dt>服务</dt><dd id="st-service">…</dd>
+  <dt>上游</dt><dd id="st-upstream">…</dd>
+  <dt>transport</dt><dd id="st-transport">…</dd>
+  <dt>Freemodel key</dt><dd id="st-key">读取状态需要填写上面的代理 key</dd>
+  <dt>可用模型</dt><dd id="st-models">读取状态需要填写上面的代理 key</dd>
+</dl>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const origin = location.origin;
+$("base").value = origin + "/v1";
+$("anthropic").value = origin;
+
+function say(node, text, kind) {
+  node.textContent = text;
+  node.className = "msg" + (kind ? " " + kind : "");
+}
+
+// clipboard API 只在 https / localhost 这类安全上下文里可用。局域网 IP 上跑 http 时
+// 它是 undefined，所以必须有退路：选中输入框内容，让用户自己按 Ctrl+C。
+for (const button of document.querySelectorAll("[data-copy]")) {
+  button.addEventListener("click", async () => {
+    const input = $(button.dataset.copy);
+    try {
+      await navigator.clipboard.writeText(input.value);
+      say($("copy-msg"), "已复制：" + input.value, "ok");
+    } catch {
+      input.focus();
+      input.select();
+      say($("copy-msg"), "此浏览器不允许自动复制（需要 HTTPS），已选中，请按 Ctrl+C。", "err");
+    }
+  });
+}
+
+function authHeaders() {
+  const key = $("proxy-key").value.trim();
+  return key ? { Authorization: "Bearer " + key } : {};
+}
+
+async function readJson(response) {
+  const body = await response.json().catch(() => null);
+  if (response.ok) return body;
+  const detail = body && body.error && body.error.message;
+  throw new Error(detail || ("HTTP " + response.status));
+}
+
+async function loadHealth() {
+  try {
+    const health = await readJson(await fetch("/health"));
+    $("st-service").textContent = health.service + " " + health.version;
+    $("st-upstream").textContent = health.logical_service + "（" + health.upstream_mode + "）";
+    $("st-transport").textContent = health.transport;
+  } catch (error) {
+    $("st-service").textContent = "读取失败：" + error.message;
+  }
+}
+
+async function loadStatus() {
+  const headers = authHeaders();
+  try {
+    const status = await readJson(await fetch("/setup/key", { headers }));
+    $("st-key").textContent = status.configured ? status.freemodel_key : "未配置";
+  } catch (error) {
+    $("st-key").textContent = "读取失败：" + error.message;
+  }
+  try {
+    const models = await readJson(await fetch("/v1/models", { headers }));
+    $("st-models").textContent = models.data.map((m) => m.id).join("、");
+  } catch (error) {
+    $("st-models").textContent = "读取失败：" + error.message;
+  }
+}
+
+$("refresh").addEventListener("click", loadStatus);
+
+$("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("freemodel-key");
+  const key = input.value.trim();
+  if (!key) {
+    say($("save-msg"), "请先填写 Freemodel key。", "err");
+    input.focus();
+    return;
+  }
+  say($("save-msg"), "保存中…");
+  try {
+    const saved = await readJson(await fetch("/setup/key", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ key }),
+    }));
+    // 输入框清空，免得完整 key 一直挂在屏幕上。
+    input.value = "";
+    say($("save-msg"), "已保存并立即生效：" + saved.freemodel_key, "ok");
+    $("st-key").textContent = saved.freemodel_key;
+    loadStatus();
+  } catch (error) {
+    say($("save-msg"), "保存失败：" + error.message, "err");
+  }
+});
+
+loadHealth();
+</script>
+</body>
+</html>

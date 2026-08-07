@@ -2,7 +2,7 @@ use crate::{
     acp::AcpTransport,
     anthropic::{self, AnthropicStreamEncoder},
     cc,
-    config::Config,
+    config::{Config, mask_key},
     error::{AcpError, ProxyError},
     models::{NormalizedEvent, SessionRecord},
     openai,
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -101,6 +101,9 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub gateways: GatewayLocks,
     pub started_at: Instant,
+    /// 上游 key 单独存一份可写副本，好让 Web 设定页保存后立刻生效而不用重启容器。
+    /// config 的其余字段仍然不可变——只有这一项需要运行时改。
+    api_key: Arc<RwLock<String>>,
 }
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
@@ -119,6 +122,7 @@ impl AppState {
             .build()
             .map_err(|e| ProxyError::Internal(e.to_string()))?;
         Ok(Self {
+            api_key: Arc::new(RwLock::new(config.api_key.clone())),
             config: Arc::new(config),
             store,
             sidecars,
@@ -126,6 +130,25 @@ impl AppState {
             gateways: Default::default(),
             started_at: Instant::now(),
         })
+    }
+
+    /// 锁中毒时取回内层值而不是 panic：key 只是一个 String，读到上一个值也远好过
+    /// 让整个代理跟着一起挂。
+    pub fn upstream_key(&self) -> String {
+        self.api_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 先落盘再换内存。反过来会造出「这次能用、重启后又回退」的状态，比直接报错更难查。
+    pub fn set_upstream_key(&self, key: &str) -> Result<(), ProxyError> {
+        self.config.save_api_key(key)?;
+        *self
+            .api_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = key.to_string();
+        Ok(())
     }
 }
 
@@ -151,6 +174,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(health))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/setup", get(setup_page))
+        .route("/setup/key", get(setup_status).post(setup_save_key))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(messages))
@@ -188,8 +213,86 @@ async fn health(State(s): State<AppState>) -> Json<Value> {
         "direct_http"
     };
     Json(
-        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"build_id":crate::BUILD_ID,"uptime_seconds":s.started_at.elapsed().as_secs(),"logical_service":s.config.base_url,"transport":s.config.transport,"upstream_mode":upstream_mode}),
+        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"build_id":crate::BUILD_ID,"uptime_seconds":s.started_at.elapsed().as_secs(),"logical_service":s.config.base_url,"transport":s.config.transport,"upstream_mode":upstream_mode,"setup_url":"/setup"}),
     )
+}
+
+/// Web 设定页。刻意不放在 `/proxy/*` 下面：那组路由只认真 loopback peer IP，而浏览器
+/// 经 Docker 端口映射进来的 peer IP 是 `172.x.x.1`，页面会被自己的安全策略挡在门外。
+/// 页面本身不含任何秘密，所以静态返回；读写状态都走下面两个带鉴权的 JSON 端点。
+async fn setup_page() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("setup.html"),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SetupKeyBody {
+    key: String,
+}
+
+async fn setup_status(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !proxy_auth(&headers, &s.config) {
+        return proxy_auth_error();
+    }
+    let key = s.upstream_key();
+    Json(json!({
+        "configured": !key.trim().is_empty(),
+        "freemodel_key": mask_key(&key),
+        "transport": s.config.transport,
+        "logical_service": s.config.base_url,
+    }))
+    .into_response()
+}
+
+async fn setup_save_key(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupKeyBody>,
+) -> Response {
+    if !proxy_auth(&headers, &s.config) {
+        return proxy_auth_error();
+    }
+    let key = match validate_upstream_key(&body.key) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = s.set_upstream_key(&key) {
+        return error.into_response();
+    }
+    // 只回掩码：这个响应会进浏览器历史、反代日志和用户截图。
+    Json(json!({
+        "saved": true,
+        "configured": true,
+        "freemodel_key": mask_key(&key),
+    }))
+    .into_response()
+}
+
+/// key 会被拼进 `Authorization` header，所以控制字符和空白在入口就挡掉：放过去要么让
+/// reqwest 报一个和原因无关的错，要么带上 header 注入的味道。顺手挡掉整段粘错的情况——
+/// 用户的 key 文件里 key 后面还跟着两行 URL，全选复制是常见手滑。
+fn validate_upstream_key(raw: &str) -> Result<String, ProxyError> {
+    const MAX_API_KEY_BYTES: usize = 512;
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(ProxyError::Invalid(
+            "The Freemodel API key must not be empty".into(),
+        ));
+    }
+    if key.len() > MAX_API_KEY_BYTES {
+        return Err(ProxyError::Invalid(format!(
+            "The Freemodel API key must be at most {MAX_API_KEY_BYTES} bytes"
+        )));
+    }
+    if !key.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(ProxyError::Invalid(
+            "The Freemodel API key must contain only printable ASCII characters".into(),
+        ));
+    }
+    Ok(key.to_string())
 }
 
 async fn ready(State(s): State<AppState>) -> Response {
@@ -424,8 +527,9 @@ fn proxy_auth_error() -> Response {
     )
 }
 
-fn auth(_headers: &HeaderMap, c: &Config) -> Option<String> {
-    (!c.api_key.is_empty()).then(|| format!("Bearer {}", c.api_key))
+fn auth(_headers: &HeaderMap, s: &AppState) -> Option<String> {
+    let key = s.upstream_key();
+    (!key.is_empty()).then(|| format!("Bearer {key}"))
 }
 fn json_error(status: StatusCode, message: &str, kind: &str) -> Response {
     (
@@ -803,10 +907,11 @@ async fn cc_upstream(
     payload: impl Fn(&str) -> Value,
 ) -> Result<reqwest::Response, Response> {
     // 没有 key 时上游只会回一句含糊的 401，说清楚缺什么比透传更有用。
-    if s.config.api_key.trim().is_empty() {
+    let api_key = s.upstream_key();
+    if api_key.trim().is_empty() {
         return Err(json_error(
             StatusCode::UNAUTHORIZED,
-            "No Freemodel API key is configured. Set FREEMODEL_API_KEY or run `key set`.",
+            "No Freemodel API key is configured. Open /setup, set FREEMODEL_API_KEY, or run `key set`.",
             "authentication_error",
         ));
     }
@@ -821,7 +926,7 @@ async fn cc_upstream(
             s.client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
-                .header(header::AUTHORIZATION, format!("Bearer {}", s.config.api_key))
+                .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
                 .json(&payload(candidate)),
         )
         .await?;
@@ -1001,7 +1106,7 @@ async fn direct_chat(
         s.config.base_url.trim_end_matches('/')
     );
     let mut req = s.client.post(url).json(&body);
-    if let Some(a) = auth(headers, &s.config) {
+    if let Some(a) = auth(headers, s) {
         req = req.header(header::AUTHORIZATION, a);
     }
     let response = match send_upstream(req).await {
@@ -1501,7 +1606,7 @@ async fn direct_responses_stream(
         s.config.base_url.trim_end_matches('/')
     );
     let mut req = s.client.post(url).json(&chat);
-    if let Some(a) = auth(headers, &s.config) {
+    if let Some(a) = auth(headers, s) {
         req = req.header(header::AUTHORIZATION, a);
     }
     let response = match req.send().await {

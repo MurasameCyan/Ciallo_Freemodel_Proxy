@@ -40,7 +40,7 @@ pub async fn run(config: &crate::config::Config) -> Result<()> {
             "not found"
         }
     );
-    println!("API key: {}", mask_key(&config.api_key));
+    println!("API key: {}", crate::config::mask_key(&config.api_key));
     let pref_path = preferences_path(&config.runtime_dir);
     let mut prefs = Preferences::load(&pref_path);
     let client = ProxyClient::new(&proxy_url, config.api_key.clone())?;
@@ -549,18 +549,4 @@ async fn terminal_change_project(
         app.projects.truncate(10);
     }
     Ok(())
-}
-fn mask_key(value: &str) -> String {
-    if value.is_empty() {
-        "not configured".into()
-    } else if value.chars().count() > 8 {
-        let chars: Vec<_> = value.chars().collect();
-        format!(
-            "{}••••{}",
-            chars[..4].iter().collect::<String>(),
-            chars[chars.len() - 4..].iter().collect::<String>()
-        )
-    } else {
-        "configured".into()
-    }
 }

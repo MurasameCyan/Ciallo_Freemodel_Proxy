@@ -29,6 +29,20 @@ docker exec -it freemodel-proxy freemodel-workbuddy-proxy key set
 docker compose restart
 ```
 
+## Web 设定页 `/setup`
+
+不想碰命令行就用浏览器打开 <http://127.0.0.1:40589/setup>。页面能做三件事：
+
+- 填 Freemodel key。**保存立即生效**，不用重启容器；同时写进 `/data/config.json`，容器重建也不丢。上面那条 `key set` 是等价物，区别是它必须重启才生效。
+- 显示该抄给客户端的反代地址（OpenAI 与 Anthropic 各一条），带复制按钮。地址取自浏览器地址栏，所以经域名或反向代理访问时给出的也是外部可用的那个，而不是容器内视角的 `127.0.0.1`。
+- 显示当前 transport、上游地址和 `/v1/models` 的真实后端列表。
+
+页面本身不含任何秘密，所以 `GET /setup` 不鉴权；读写设定的 `GET`/`POST /setup/key` 与 `/v1/*` 共用同一把 `PROXY_API_KEY`，需要在页面上先填「代理自调用 key」。那把 key 只在页面打开期间留在输入框里，不写 localStorage，刷新后要重填。
+
+设定页刻意不放在 `/proxy/*` 下：那组路由只认真 loopback peer IP，而浏览器经端口映射进来的 peer IP 是 `172.x.x.1`，页面会被自己的安全策略挡在门外（见下面「管理 API 被拒绝」）。
+
+响应只回掩码形式的 key（`fe_o••••page`），不回显全量——它会进浏览器历史、反代日志和用户截图。key 里出现换行、空格或非 ASCII 字符会被直接拒绝：它要拼进 `Authorization` header，放过去只会换来一个和原因无关的报错。
+
 可用模型只有三个真实后端：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`，`/v1/models` 在这个 transport 下只报这三个。其它 Claude 别名（如 `claude-sonnet-5`）会被上游静默改换成别的后端，代理按 `message_start.model` 把真实后端名回显给客户端，因此响应里的 `model` 可能和你请求的不一样，这是上游行为而不是代理改写。非 `claude-*` 的名字（如客户端默认的 `gpt-4o`）上游不认，代理会直接用 `claude-opus-5` 起步。
 
 上游是共享容器池，占满时返回 500 `Maximum number of running container instances exceeded`，与账号配额无关且随机发生。代理遇到这个错误会沿 `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001` 换后端重试，每次重试前退避 2/4/6 秒，只有全部失败才回 502。4xx（含 401 key 无效）不重试。
@@ -229,6 +243,9 @@ WORKBUDDY_ACP_PASSWORD=你的本地gateway密码
 ## 验证部署
 
 ```bash
+# Web 设定页（浏览器打开同一个地址）
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' http://127.0.0.1:40589/setup
+
 # 进程与配置存活检查（不探测上游）
 curl -sS http://127.0.0.1:40589/health
 
@@ -325,7 +342,7 @@ docker buildx imagetools inspect ghcr.io/murasamecyan/ciallo_freemodel_proxy:lat
 
 ### 改了 `.env` 里的 key 但没生效
 
-`key set` 会把 key 写进 `/data/config.json`，而 `config.json` 的优先级**高于**环境变量（这是刻意设计，防止外部环境覆盖显式项目配置）。轮换 key 时要么再跑一次 `key set`，要么删掉 `/data/config.json` 里的 `FREEMODEL_API_KEY` 字段。
+`key set` 和 Web 设定页都会把 key 写进 `/data/config.json`，而 `config.json` 的优先级**高于**环境变量（这是刻意设计，防止外部环境覆盖显式项目配置）。轮换 key 时要么在 `/setup` 里重存一次，要么再跑一次 `key set`，要么删掉 `/data/config.json` 里的 `FREEMODEL_API_KEY` 字段。
 
 ### 响应里的 `model` 和请求的不一样
 
@@ -355,7 +372,7 @@ docker buildx imagetools inspect ghcr.io/murasamecyan/ciallo_freemodel_proxy:lat
 docker exec freemodel-proxy curl -sS http://127.0.0.1:40589/proxy/diagnostics
 ```
 
-`/health`、`/ready`、`/v1/*` 不受此限制，从宿主机正常访问。只有 WorkBuddy 路线用 host network，那种情况下 peer IP 才是真 loopback。
+`/health`、`/ready`、`/setup`、`/v1/*` 不受此限制，从宿主机正常访问。只有 WorkBuddy 路线用 host network，那种情况下 peer IP 才是真 loopback。
 
 ## GitHub Actions 自动发布
 

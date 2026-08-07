@@ -296,6 +296,22 @@ impl Config {
     }
 }
 
+/// 展示用的 key 掩码。TUI 和 Web 设定页共用，避免两处各写一套、其中一处哪天漏出全量 key。
+pub fn mask_key(value: &str) -> String {
+    if value.is_empty() {
+        "not configured".into()
+    } else if value.chars().count() > 8 {
+        let chars: Vec<_> = value.chars().collect();
+        format!(
+            "{}••••{}",
+            chars[..4].iter().collect::<String>(),
+            chars[chars.len() - 4..].iter().collect::<String>()
+        )
+    } else {
+        "configured".into()
+    }
+}
+
 pub fn upstream_hostname(base_url: &str) -> Result<String, ProxyError> {
     let parsed = Url::parse(base_url)
         .map_err(|_| ProxyError::Invalid(format!("Invalid FREEMODEL_BASE_URL: {base_url}")))?;

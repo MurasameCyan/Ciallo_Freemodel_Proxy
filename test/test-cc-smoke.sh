@@ -87,5 +87,44 @@ if [[ "$code" != "400" ]]; then
 fi
 echo "OK: /v1/messages 已挂载且受鉴权保护"
 
+# Web 设定页必须真的打包进镜像：它是 include_str! 进二进制的，漏了会静默变成 404。
+setup_type=$(curl -fsS -o /dev/null -w '%{content_type}' "http://127.0.0.1:$PORT/setup")
+case "$setup_type" in
+    text/html*) ;;
+    *) echo "FAIL: /setup 的 content-type 是 '$setup_type'，应为 text/html" >&2; exit 1 ;;
+esac
+echo "OK: /setup 返回 HTML"
+
+# 写上游 key 的端点绝不能免鉴权：镜像绑 0.0.0.0，开放它等于让同网段任何人换你的 key。
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/setup/key" \
+  -H 'Content-Type: application/json' -d '{"key":"fe_smoke_placeholder_key"}')
+if [[ "$code" != "401" ]]; then
+    echo "FAIL: 未鉴权的 /setup/key 返回 $code，应为 401" >&2
+    exit 1
+fi
+
+# 换行必须在入口被挡掉，否则会被拼进 Authorization header。
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/setup/key" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"key":"fe_smoke\nX-Injected: 1"}')
+if [[ "$code" != "400" ]]; then
+    echo "FAIL: 含换行的 key 返回 $code，应为 400" >&2
+    exit 1
+fi
+
+# 存一把假 key，验证整条写盘路径在真镜像里跑得通（容器随后即删，不涉及真实凭据）。
+saved=$(curl -fsS -X POST "http://127.0.0.1:$PORT/setup/key" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"key":"fe_smoke_placeholder_key"}')
+python3 - "$saved" <<'PY'
+import json, sys
+saved = json.loads(sys.argv[1])
+assert saved["saved"] is True, saved
+# 响应会进浏览器历史和日志，只能回掩码。
+assert saved["freemodel_key"] == "fe_s••••_key", saved
+assert "fe_smoke_placeholder_key" not in sys.argv[1], saved
+print("OK: /setup/key 已写入并只回显掩码:", saved["freemodel_key"])
+PY
+
 echo "cc 冒烟测试通过。"
 
