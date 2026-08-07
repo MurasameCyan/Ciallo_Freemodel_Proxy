@@ -7,23 +7,18 @@ services:
     # build: .
     container_name: freemodel-proxy
     restart: unless-stopped
-    # WorkBuddy gateway 只监听宿主机 127.0.0.1。Docker Desktop 4.34+
-    # 需先在 Settings > Resources > Network 启用 host networking。
-    network_mode: host
+    ports:
+      # 默认只绑宿主机 127.0.0.1。要给局域网用就改成 0.0.0.0，
+      # 但必须同时设置 PROXY_API_KEY，否则谁都能用你的额度。
+      # 容器内固定监听 40589，这里只改宿主机侧。
+      - "${PROXY_BIND:-127.0.0.1}:${PROXY_HOST_PORT:-40589}:40589"
     environment:
-      # host 网络下直接由应用限制监听范围，不再使用 ports 映射。
-      PROXY_HOST: 127.0.0.1
-      FREEMODEL_BASE_URL: ${FREEMODEL_BASE_URL:-https://work.freemodel.dev/v1}
-      FREEMODEL_TRANSPORT: ${FREEMODEL_TRANSPORT:-workbuddy_acp}
-      WORKBUDDY_SIDECAR_MODE: ${WORKBUDDY_SIDECAR_MODE:-external}
-      # network_mode: host 下容器可连接宿主机仅监听 127.0.0.1 的 gateway。
-      WORKBUDDY_ACP_URL: ${WORKBUDDY_ACP_URL:-http://127.0.0.1:44741}
-      # ACP session/new 由宿主机 WorkBuddy 执行，必须传宿主机可见的真实目录。
-      WORKBUDDY_EXTERNAL_CWD: "${WORKBUDDY_EXTERNAL_CWD:?请在 .env 中设置宿主机 WorkBuddy 可访问的工作目录}"
-      WORKBUDDY_ACP_PASSWORD: ${WORKBUDDY_ACP_PASSWORD:-}
-      # direct HTTP 回退模式才使用 FREEMODEL_API_KEY；它不能替代 WorkBuddy 登录。
+      # cc.freemodel.dev 只认 Bearer {FREEMODEL_API_KEY}，不需要任何登录态。
+      FREEMODEL_BASE_URL: ${FREEMODEL_BASE_URL:-https://cc.freemodel.dev/v1}
+      FREEMODEL_TRANSPORT: ${FREEMODEL_TRANSPORT:-cc_anthropic}
+      # 你的 Freemodel key。留空可在启动后用 key set 写入 /data 卷。
       FREEMODEL_API_KEY: ${FREEMODEL_API_KEY:-}
-      # 留空则代理自身不鉴权。对外暴露端口时必须设置。
+      # 客户端调用本代理时使用的密钥，不要把 Freemodel key 直接发给客户端。
       PROXY_API_KEY: ${PROXY_API_KEY:-}
     volumes:
       # 代理会话元数据与运行时文件。

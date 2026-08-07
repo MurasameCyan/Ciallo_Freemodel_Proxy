@@ -58,13 +58,29 @@ jobs:
 
       # 仅构建 linux/amd64。arm64 需经 QEMU 模拟编译整个 Rust 依赖树
       # (含 LTO)，耗时可达一小时以上且易超时。如需 arm64，见 DOCKER.md。
-      - name: Build and push
+      # 先 load 到本地跑冒烟测试，再推送：坏镜像不该先落到用户能 pull 的 tag 上。
+      - name: Build image locally
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.img.outputs.name }}:ci-smoke
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # 只验证默认 cc 配置能起来并正确鉴权，不发上游请求、不消耗额度。
+      - name: Smoke test default cc transport
+        run: bash test/test-cc-smoke.sh "${{ steps.img.outputs.name }}:ci-smoke"
+
+      - name: Push tags
+        if: github.event_name != 'pull_request'
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker push "$tag"
+          done <<< '${{ steps.meta.outputs.tags }}'

@@ -33,18 +33,13 @@ RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
 
 登录、真实 ACP 请求和重启后再次请求必须全部通过，P0 才算可行。不要执行 `docker compose -f docker-compose.codebuddy-p0.yml down -v`，除非你明确要删除 `/data` volume 和登录态。详细验收和故障含义见 [DOCKER.md](DOCKER.md)。
 
-## 🐳 Docker 快速开始
+## 🐳 Docker 快速开始（只要一个 key）
 
-`work.freemodel.dev` 只接受官方 WorkBuddy 客户端。容器不会复制、伪造或打包私有认证，而是通过 ACP 复用宿主机**已登录且正在运行**的 WorkBuddy gateway。
-
-1. 在宿主机启动并登录官方 WorkBuddy，确认其 ACP gateway 监听 `127.0.0.1:44741`。
-2. Docker Desktop 4.34+ 打开 **Settings → Resources → Network → Enable host networking**。
-3. 将 `.env.example` 复制为 `.env`，把 `WORKBUDDY_EXTERNAL_CWD` 填成**宿主机 WorkBuddy 可访问的真实工作目录**；它不能写成容器路径 `/workspace`。
-4. 启动代理：
+默认走 `cc.freemodel.dev`：它讲 Anthropic Messages 协议，鉴权只看 `Bearer {FREEMODEL_API_KEY}`，**不需要登录，也不需要在宿主机装任何东西**。代理把客户端的 OpenAI 协议翻译过去再翻译回来，所以现有客户端不用改。
 
 ```bash
-# Git Bash / WSL / Linux / macOS
 cp .env.example .env
+# 编辑 .env：填 FREEMODEL_API_KEY，并设一个 PROXY_API_KEY
 docker compose up -d
 ```
 
@@ -55,25 +50,42 @@ Copy-Item .env.example .env
 Docker Compose up -d
 ```
 
+也可以先不填 key，启动后再写（存进 `/data` 卷，容器重建不丢）：
+
+```bash
+docker exec -it freemodel-proxy freemodel-workbuddy-proxy key set
+docker compose restart
+```
+
 等价的 `docker run`：
 
 ```bash
 docker run -d --name freemodel-proxy \
-  --network host \
-  -e PROXY_HOST=127.0.0.1 \
-  -e FREEMODEL_BASE_URL=https://work.freemodel.dev/v1 \
-  -e FREEMODEL_TRANSPORT=workbuddy_acp \
-  -e WORKBUDDY_SIDECAR_MODE=external \
-  -e WORKBUDDY_ACP_URL=http://127.0.0.1:44741 \
-  -e WORKBUDDY_EXTERNAL_CWD="$(pwd)/workspace" \
+  -p 127.0.0.1:40589:40589 \
+  -e FREEMODEL_API_KEY="$YOUR_FREEMODEL_KEY" \
+  -e PROXY_API_KEY="$YOUR_PROXY_KEY" \
   -v freemodel-proxy-data:/data \
-  -v "$(pwd)/workspace:/workspace" \
   ghcr.io/murasamecyan/ciallo_freemodel_proxy:latest
 ```
 
-镜像名全小写是 GHCR 的硬性要求，与仓库原名 `MurasameCyan/Ciallo_Freemodel_Proxy` 的大小写无关。客户端 Base URL 填 `http://127.0.0.1:40589/v1`，模型可用 `gpt-5.6-sol`、`gpt-4o`、`opencode-default`。
+镜像名全小写是 GHCR 的硬性要求，与仓库原名 `MurasameCyan/Ciallo_Freemodel_Proxy` 的大小写无关。
 
-> `key.txt` 里的 `fe_...` key 可用于 `api.freemodel.dev`，但实测不能代替 WorkBuddy/CodeBuddy 登录；把它作为 `CODEBUDDY_AUTH_TOKEN` 或 `CODEBUDDY_API_KEY` 都不能获得 `work.freemodel.dev` 权限。
+客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试。
+
+每次响应都带 `usage`（含 `cached_tokens`），用它核对真实消耗。
+
+### 备选：work.freemodel.dev
+
+`work.freemodel.dev` 只接受官方 WorkBuddy 客户端。容器不会复制、伪造或打包私有认证，而是通过 ACP 复用宿主机**已登录且正在运行**的 WorkBuddy gateway。
+
+1. 在宿主机启动并登录官方 WorkBuddy，确认其 ACP gateway 监听 `127.0.0.1:44741`。
+2. Docker Desktop 4.34+ 打开 **Settings → Resources → Network → Enable host networking**。
+3. 在 `.env` 中取消 `work.freemodel.dev` 那一组注释，把 `WORKBUDDY_EXTERNAL_CWD` 填成**宿主机 WorkBuddy 可访问的真实工作目录**；它不能写成容器路径 `/workspace`。
+4. `docker compose -f docker-compose.workbuddy.yml up -d`
+
+该路线模型名为 `gpt-5.6-sol`、`gpt-4o`、`opencode-default`。
+
+> `key.txt` 里的 `fe_...` key 可直接用于 `cc.freemodel.dev` 和 `api.freemodel.dev`，但实测不能代替 WorkBuddy/CodeBuddy 登录；把它作为 `CODEBUDDY_AUTH_TOKEN` 或 `CODEBUDDY_API_KEY` 都不能获得 `work.freemodel.dev` 权限。
 
 详细部署、gateway 端口确认和故障排查见 [DOCKER.md](DOCKER.md)。
 
@@ -81,11 +93,11 @@ docker run -d --name freemodel-proxy \
 
 | | 容器默认 | 本地默认 |
 | --- | --- | --- |
-| `FREEMODEL_BASE_URL` | `https://work.freemodel.dev/v1` | `https://work.freemodel.dev/v1` |
-| `FREEMODEL_TRANSPORT` | `workbuddy_acp` | `workbuddy_acp` |
-| `WORKBUDDY_SIDECAR_MODE` | `external`，连接宿主机 gateway | `managed`，按会话启动官方 CLI sidecar |
+| `FREEMODEL_BASE_URL` | `https://cc.freemodel.dev/v1` | `https://work.freemodel.dev/v1` |
+| `FREEMODEL_TRANSPORT` | `cc_anthropic` | `workbuddy_acp` |
+| `WORKBUDDY_SIDECAR_MODE` | `external`（仅 ACP 路线用到） | `managed`，按会话启动官方 CLI sidecar |
 
-管理类路由（`/proxy/sessions`、`/proxy/diagnostics`）限制为 loopback 访问。Compose 使用 host 网络并让代理只监听 `127.0.0.1`，因此宿主机可正常管理；如果将 `PROXY_HOST` 改成 `0.0.0.0`，必须同时设置强随机 `PROXY_API_KEY`。
+管理类路由（`/proxy/sessions`、`/proxy/diagnostics`）按实际 peer IP 限制为 loopback。容器用端口映射时，宿主机的请求经 bridge 网关进来，peer IP 不是 `127.0.0.1`，这些路由会被拒绝；需要时用 `docker exec freemodel-proxy curl http://127.0.0.1:40589/proxy/diagnostics` 在容器内调用。`/health`、`/ready`、`/v1/*` 不受影响。Compose 默认只把端口绑到宿主机 `127.0.0.1`；如果改成 `0.0.0.0`，必须同时设置强随机 `PROXY_API_KEY`——代理持有你的上游 key，无鉴权暴露等于把 key 借给同网段任何人。
 
 ---
 
@@ -108,21 +120,22 @@ docker run -d --name freemodel-proxy \
 
 ## 🔀 Transport Configuration
 
-The proxy supports two transports:
+The proxy supports three transports, and it picks one automatically from the `FREEMODEL_BASE_URL` host, so you normally do not set `FREEMODEL_TRANSPORT` at all:
 
-- `workbuddy_acp` (default): Official WorkBuddy ACP for the logical WorkBuddy service at `https://work.freemodel.dev/v1`. The OpenAI-style service route is `https://work.freemodel.dev/v1/chat/completions`, but the proxy deliberately does **not** POST to that protected URL. It launches or discovers an authenticated local CodeBuddy ACP gateway and exchanges ACP messages through loopback `/api/v1/acp`.
-- `http`: Direct OpenAI-compatible HTTP only when you explicitly configure another upstream. Do not use this transport with `work.freemodel.dev`.
+- `cc_anthropic` (auto for `cc.freemodel.dev`): Translates OpenAI Chat Completions to Anthropic Messages against `https://cc.freemodel.dev/v1/messages`. Auth is only `Bearer {FREEMODEL_API_KEY}` — no login, no local gateway, nothing installed on the host. On upstream HTTP 500 `Maximum number of running container instances exceeded` (shared container pool, unrelated to your quota) the proxy retries down `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001`; 4xx never retries. The real backend name is read from `message_start.model`, because upstream silently swaps models.
+- `workbuddy_acp` (auto for `work.freemodel.dev`, and required there): Official WorkBuddy ACP for the logical WorkBuddy service at `https://work.freemodel.dev/v1`. The OpenAI-style service route is `https://work.freemodel.dev/v1/chat/completions`, but the proxy deliberately does **not** POST to that protected URL. It launches or discovers an authenticated local CodeBuddy ACP gateway and exchanges ACP messages through loopback `/api/v1/acp`.
+- `http` (auto for anything else): Direct OpenAI-compatible passthrough. Do not use this transport with `work.freemodel.dev`.
 
-The default configuration is equivalent to:
+The Docker default is equivalent to:
 
 ```json
 {
-  "FREEMODEL_BASE_URL": "https://work.freemodel.dev/v1",
-  "FREEMODEL_TRANSPORT": "workbuddy_acp"
+  "FREEMODEL_BASE_URL": "https://cc.freemodel.dev/v1",
+  "FREEMODEL_TRANSPORT": "cc_anthropic"
 }
 ```
 
-You may place those values in the ignored local `config.json`, but they do not need to be repeated. For a deliberate generic HTTP upstream, configure its base URL (normally ending in `/v1`, without `/chat/completions`) and set `FREEMODEL_TRANSPORT` to `http`; the proxy appends `/chat/completions` only on that direct-HTTP path.
+You may place those values in the ignored local `config.json`, but they do not need to be repeated. Note that `config.json` takes precedence over environment variables by design, so a key written by `key set` wins over a later `FREEMODEL_API_KEY` in the environment. For a deliberate generic HTTP upstream, configure its base URL (normally ending in `/v1`, without `/chat/completions`) and set `FREEMODEL_TRANSPORT` to `http`; the proxy appends `/chat/completions` only on that direct-HTTP path.
 
 For the default protected service, local execution uses `WORKBUDDY_SIDECAR_MODE=managed` and launches the official CodeBuddy CLI as a dedicated gateway for each proxy session. Docker uses `WORKBUDDY_SIDECAR_MODE=external` and connects to the already authenticated official WorkBuddy gateway at `WORKBUDDY_ACP_URL`; it never copies or imitates private HTTP authentication.
 
@@ -138,6 +151,8 @@ Optional ACP settings are `WORKBUDDY_ACP_TIMEOUT` and `WORKBUDDY_ACP_MAX_ATTEMPT
 - `PROXY_SIDECAR_IDLE_TIMEOUT`: seconds before an inactive sidecar is stopped; its session metadata remains reusable.
 - `PROXY_MAX_HISTORY_TURNS`: number of user/assistant turn pairs retained for the TUI.
 - `PROXY_API_KEY`: optional Bearer key required by `/v1/models`, `/v1/chat/completions`, and `/v1/responses`. Loopback-only management and health routes remain available locally. When enabled, the proxy uses `FREEMODEL_API_KEY` for the direct upstream instead of forwarding the proxy credential.
+
+`cc_anthropic` ignores every `WORKBUDDY_*` and sidecar setting; it needs only `FREEMODEL_BASE_URL` and `FREEMODEL_API_KEY`. Its responses always carry `usage`, with cache reads folded into `prompt_tokens` and broken out under `prompt_tokens_details.cached_tokens`; streaming attaches them to the finish chunk. `/v1/models` reports only the three real cc backends on this transport.
 
 `WORKBUDDY_ACP_URL` and `WORKBUDDY_EXTERNAL_CWD` are required when `workbuddy_acp` uses external mode. `WORKBUDDY_ACP_CWD` and `WORKBUDDY_ACP_PASSWORD` remain available for manual ACP configuration. `/health` is a process/configuration liveness check; use `/ready` or a real ACP request to verify that the external gateway is reachable. Never commit gateway passwords or API keys.
 
@@ -288,14 +303,15 @@ The protected WorkBuddy ACP transport remains project-scoped—its sidecar and A
 
 ### Skills, tools, and images compatibility
 
-| Capability | Direct HTTP (`http`) | WorkBuddy ACP (`workbuddy_acp`) |
-| --- | --- | --- |
-| `/v1/responses` text | Yes | Yes |
-| Client function-tool loop | Yes | No; rejected explicitly |
-| Codex/WorkBuddy skills | Executed by the client through its function-tool loop; the proxy transports calls and results | Sidecar-internal skills may be available, but they are not exposed as a transparent client tool loop |
-| Vision/image input | HTTP(S) and `data:image/...` URLs | Not supported through the ACP text transport |
-| Bare local image paths | No; the client must read/encode them | No |
-| Image generation | No image-generation endpoint or output-event translation | No |
+| Capability | Direct HTTP (`http`) | WorkBuddy ACP (`workbuddy_acp`) | cc Anthropic (`cc_anthropic`) |
+| --- | --- | --- | --- |
+| `/v1/chat/completions` text, streaming and not | Yes | Yes | Yes |
+| `/v1/responses` text | Yes | Yes | No; returns an explicit `400` — use `/v1/chat/completions` |
+| Client function-tool loop | Yes | No; rejected explicitly | No; text only |
+| Codex/WorkBuddy skills | Executed by the client through its function-tool loop; the proxy transports calls and results | Sidecar-internal skills may be available, but they are not exposed as a transparent client tool loop | Not applicable |
+| Vision/image input | HTTP(S) and `data:image/...` URLs | Not supported through the ACP text transport | No; multipart content is flattened to text |
+| Bare local image paths | No; the client must read/encode them | No | No |
+| Image generation | No image-generation endpoint or output-event translation | No | No |
 
 A skill is not installed or executed by the proxy itself. Codex or WorkBuddy owns skill discovery, permissions, and execution; the direct transport preserves the Responses function calls needed for that workflow. Image understanding (vision input) must not be confused with image generation, which this proxy does not implement.
 

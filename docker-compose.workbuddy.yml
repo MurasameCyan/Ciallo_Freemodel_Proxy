@@ -1,0 +1,37 @@
+# work.freemodel.dev 变体：需要宿主机已登录并运行的官方 WorkBuddy ACP gateway。
+# 默认路径（cc.freemodel.dev，只要一个 key）见 docker-compose.yml。
+# 用法：docker compose -f docker-compose.workbuddy.yml up -d
+services:
+  freemodel-proxy:
+    # GHCR 镜像名必须全小写，因此这里是 murasamecyan/ciallo_freemodel_proxy
+    # 而非仓库原名 MurasameCyan/Ciallo_Freemodel_Proxy。
+    image: ghcr.io/${IMAGE_REPO:-murasamecyan/ciallo_freemodel_proxy}:latest
+    # build: .
+    container_name: freemodel-proxy
+    restart: unless-stopped
+    # WorkBuddy gateway 只监听宿主机 127.0.0.1。Docker Desktop 4.34+
+    # 需先在 Settings > Resources > Network 启用 host networking。
+    network_mode: host
+    environment:
+      # host 网络下直接由应用限制监听范围，不再使用 ports 映射。
+      PROXY_HOST: 127.0.0.1
+      FREEMODEL_BASE_URL: ${FREEMODEL_BASE_URL:-https://work.freemodel.dev/v1}
+      FREEMODEL_TRANSPORT: ${FREEMODEL_TRANSPORT:-workbuddy_acp}
+      WORKBUDDY_SIDECAR_MODE: ${WORKBUDDY_SIDECAR_MODE:-external}
+      # network_mode: host 下容器可连接宿主机仅监听 127.0.0.1 的 gateway。
+      WORKBUDDY_ACP_URL: ${WORKBUDDY_ACP_URL:-http://127.0.0.1:44741}
+      # ACP session/new 由宿主机 WorkBuddy 执行，必须传宿主机可见的真实目录。
+      WORKBUDDY_EXTERNAL_CWD: "${WORKBUDDY_EXTERNAL_CWD:?请在 .env 中设置宿主机 WorkBuddy 可访问的工作目录}"
+      WORKBUDDY_ACP_PASSWORD: ${WORKBUDDY_ACP_PASSWORD:-}
+      # 此模式下 FREEMODEL_API_KEY 不参与鉴权，登录态由宿主机 gateway 持有。
+      FREEMODEL_API_KEY: ${FREEMODEL_API_KEY:-}
+      # 留空则代理自身不鉴权。对外暴露端口时必须设置。
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+    volumes:
+      # 代理会话元数据与运行时文件。
+      - proxy-data:/data
+      # 供客户端访问的工作目录，对应 PROXY_DEFAULT_PROJECT。
+      - ./workspace:/workspace
+
+volumes:
+  proxy-data:

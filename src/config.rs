@@ -70,11 +70,21 @@ impl Config {
             .trim_end_matches('/')
             .to_string();
         let protected = is_protected_workbuddy_url(&base_url)?;
-        let transport_default = if protected { "workbuddy_acp" } else { "http" };
+        let cc = is_cc_url(&base_url)?;
+        let transport_default = if protected {
+            "workbuddy_acp"
+        } else if cc {
+            "cc_anthropic"
+        } else {
+            "http"
+        };
         let transport = text("FREEMODEL_TRANSPORT", transport_default)
             .trim()
             .to_lowercase();
-        if transport != "http" && transport != "workbuddy_acp" {
+        if !matches!(
+            transport.as_str(),
+            "http" | "workbuddy_acp" | "cc_anthropic"
+        ) {
             return Err(ProxyError::Invalid(format!(
                 "Unsupported FREEMODEL_TRANSPORT: {transport}"
             )));
@@ -208,6 +218,8 @@ impl Config {
             expand_path(configured_cli.trim(), &home)
         };
 
+        let models = available_models(&transport);
+
         Ok(Self {
             project_root: project_root.clone(),
             config_file,
@@ -251,7 +263,7 @@ impl Config {
             cors_origins,
             proxy_api_key: text("PROXY_API_KEY", ""),
             max_sidecars,
-            models: available_models(),
+            models,
         })
     }
 
@@ -296,6 +308,12 @@ pub fn upstream_hostname(base_url: &str) -> Result<String, ProxyError> {
 
 pub fn is_protected_workbuddy_url(base_url: &str) -> Result<bool, ProxyError> {
     Ok(upstream_hostname(base_url)? == "work.freemodel.dev")
+}
+
+/// cc.freemodel.dev 讲 Anthropic Messages 协议，且只认 `Bearer {FREEMODEL_API_KEY}`，
+/// 无需 CodeBuddy 登录态，因此默认走 `cc_anthropic` 而非 `http`。
+pub fn is_cc_url(base_url: &str) -> Result<bool, ProxyError> {
+    Ok(upstream_hostname(base_url)? == "cc.freemodel.dev")
 }
 
 fn read_object(path: &Path) -> Map<String, Value> {
@@ -355,9 +373,15 @@ fn canonical_project_path(path: &Path) -> Result<PathBuf, ProxyError> {
     }
     Ok(canonical)
 }
-fn available_models() -> Vec<ModelInfo> {
-    ["gpt-5.6-sol", "gpt 5.6 sol", "gpt-4o", "opencode-default"]
-        .into_iter()
+/// cc.freemodel.dev 只认 Claude 后端名，报 gpt-* 会让客户端选到必然被上游改换的模型。
+fn available_models(transport: &str) -> Vec<ModelInfo> {
+    let ids: &[&str] = if transport == "cc_anthropic" {
+        &crate::cc::CC_BACKENDS[..]
+    } else {
+        &["gpt-5.6-sol", "gpt 5.6 sol", "gpt-4o", "opencode-default"]
+    };
+    ids.iter()
+        .copied()
         .map(|id| ModelInfo {
             id: id.into(),
             object: "model".into(),
@@ -374,5 +398,30 @@ mod tests {
     fn exact_protected_host() {
         assert!(is_protected_workbuddy_url("https://work.freemodel.dev/v1").unwrap());
         assert!(!is_protected_workbuddy_url("https://work.freemodel.dev.attacker/v1").unwrap());
+    }
+
+    #[test]
+    fn exact_cc_host() {
+        assert!(is_cc_url("https://cc.freemodel.dev/v1").unwrap());
+        assert!(!is_cc_url("https://cc.freemodel.dev.attacker/v1").unwrap());
+        assert!(!is_cc_url("https://work.freemodel.dev/v1").unwrap());
+    }
+
+    #[test]
+    fn cc_host_defaults_to_anthropic_transport_and_claude_models() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let environment = HashMap::from([
+            (
+                "FREEMODEL_BASE_URL".to_string(),
+                "https://cc.freemodel.dev/v1".to_string(),
+            ),
+            ("PROXY_DEFAULT_PROJECT".to_string(), path),
+        ]);
+        let config = Config::load_with_env(root.path(), &environment).unwrap();
+        assert_eq!(config.transport, "cc_anthropic");
+        // 只报真实后端，客户端才不会选到必被上游改换的名字。
+        assert_eq!(config.models[0].id, crate::cc::CC_BACKENDS[0]);
+        assert_eq!(config.models.len(), crate::cc::CC_BACKENDS.len());
     }
 }

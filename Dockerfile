@@ -32,25 +32,27 @@ COPY --from=builder /usr/local/bin/freemodel-workbuddy-proxy /usr/local/bin/
 # /data 存放代理会话与运行时文件。
 # 用户名不能叫 proxy：debian-slim 自带同名系统账户（uid 13），useradd 会失败。
 RUN useradd --create-home --uid 10001 freemodel \
-    && mkdir -p /app /workspace /data/runtime \
-    && chown -R freemodel:freemodel /app /workspace /data
+    && mkdir -p /workspace /data/runtime \
+    && chown -R freemodel:freemodel /workspace /data
 
 USER freemodel
-# 工作目录刻意不用 /workspace：config.rs 中 config.json 的优先级高于环境变量，
-# 而 project_root 会回落到工作目录。若用户挂载的 /workspace 里带着 config.json，
-# 就会静默覆盖镜像的环境变量配置。/app 保持为空即可避免。
-WORKDIR /app
+# 工作目录决定 config.json 的位置（config.rs 用 project_root 拼），放在 /data
+# 这个持久卷上，`key set` 存的 key 才不会随容器重建丢失。
+# 刻意不用 /workspace：那是用户挂载的目录，而 config.json 的优先级高于环境变量，
+# 用户目录里若带着 config.json 就会静默覆盖镜像配置。
+WORKDIR /data
 ENV HOME=/home/freemodel
 
 EXPOSE 40589
 
-# work.freemodel.dev 必须经官方 WorkBuddy 客户端已认证的 ACP gateway 访问。
-# 容器通过 WORKBUDDY_ACP_URL 连接宿主机 gateway，不复制或模拟私有认证。
-# WORKBUDDY_EXTERNAL_CWD 无法从容器推导，运行时必须传入宿主机可见的真实路径。
+# 默认走 cc.freemodel.dev：Anthropic Messages 协议，鉴权只需
+# Bearer {FREEMODEL_API_KEY}，容器内不需要任何登录态或额外进程。
+# 想改用 work.freemodel.dev 需同时覆盖 FREEMODEL_TRANSPORT=workbuddy_acp
+# 与 WORKBUDDY_EXTERNAL_CWD（宿主机可见的真实路径，无法从容器推导）。
 ENV PROXY_HOST=0.0.0.0 \
     PROXY_PORT=40589 \
-    FREEMODEL_BASE_URL=https://work.freemodel.dev/v1 \
-    FREEMODEL_TRANSPORT=workbuddy_acp \
+    FREEMODEL_BASE_URL=https://cc.freemodel.dev/v1 \
+    FREEMODEL_TRANSPORT=cc_anthropic \
     WORKBUDDY_SIDECAR_MODE=external \
     WORKBUDDY_ACP_URL=http://127.0.0.1:44741 \
     PROXY_DEFAULT_PROJECT=/workspace \
