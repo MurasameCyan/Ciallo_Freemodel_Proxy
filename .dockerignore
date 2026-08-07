@@ -8,8 +8,11 @@
 # 构建产物
 target/
 
-# 文档（不影响构建）
-*.md
+# 文档（不影响构建）；第三方许可证必须保留在构建上下文中
+# 以便 P0 镜像履行 CodeBuddy Code 的 MIT 再分发条件。
+docs/
+README.md
+DOCKER.md
 LICENSE
 
 # 密钥与本地配置：绝不进镜像
