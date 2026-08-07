@@ -126,5 +126,17 @@ assert "fe_smoke_placeholder_key" not in sys.argv[1], saved
 print("OK: /setup/key 已写入并只回显掩码:", saved["freemodel_key"])
 PY
 
-echo "cc 冒烟测试通过。"
+# 没有 PROXY_API_KEY 时必须拒绝启动。镜像绑 0.0.0.0，空 key 等于关闭鉴权，
+# 而这个容器持有上游额度和 /setup/key 的写入权限。曾经真的这样跑在公网上过。
+if docker run --rm "$IMAGE" >/tmp/no-key.log 2>&1; then
+    echo "FAIL: 未设置 PROXY_API_KEY 时容器竟然正常启动了" >&2
+    exit 1
+fi
+if ! grep -qF 'PROXY_API_KEY' /tmp/no-key.log; then
+    echo "FAIL: 拒绝启动的原因没有提到 PROXY_API_KEY：" >&2
+    cat /tmp/no-key.log >&2
+    exit 1
+fi
+echo "OK: 缺少 PROXY_API_KEY 时拒绝启动，且说明了原因"
 
+echo "cc 冒烟测试通过。"

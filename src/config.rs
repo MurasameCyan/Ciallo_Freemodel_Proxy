@@ -200,6 +200,19 @@ impl Config {
         if host.is_empty() {
             return Err(ProxyError::Invalid("PROXY_HOST must not be empty".into()));
         }
+        let proxy_api_key = text("PROXY_API_KEY", "");
+        // 空 PROXY_API_KEY 等于不鉴权（见 server::proxy_auth）。绑 loopback 时那只影响本机，
+        // 绑其它地址时就是把上游 key 的用量、以及 /setup/key 的写入权限交给所有能连上的人。
+        // 容器内看不出宿主机把端口发布到了 127.0.0.1 还是 0.0.0.0，所以只能按绑定地址判，
+        // 且必须 fail closed：静默放行过的实例，等发现时额度已经被人用掉了。
+        if proxy_api_key.trim().is_empty() && !is_loopback_host(&host) {
+            return Err(ProxyError::Invalid(format!(
+                "PROXY_HOST={host} 不是 loopback，必须同时设置 PROXY_API_KEY，\
+                 否则任何能访问该地址的人都能用你的上游额度并改写 key。\
+                 Docker 镜像固定绑 0.0.0.0，因此容器部署必须设置 PROXY_API_KEY：\
+                 在 .env 里写 PROXY_API_KEY=<强随机值>，或 docker run -e PROXY_API_KEY=<强随机值>。"
+            )));
+        }
         let cors_origins = text("PROXY_CORS_ORIGINS", "http://127.0.0.1,http://localhost")
             .split(',')
             .map(str::trim)
@@ -265,7 +278,7 @@ impl Config {
             host,
             port: port_raw,
             cors_origins,
-            proxy_api_key: text("PROXY_API_KEY", ""),
+            proxy_api_key,
             max_sidecars,
             models,
         })
@@ -294,6 +307,18 @@ impl Config {
         fs::set_permissions(&self.config_file, fs::Permissions::from_mode(0o600))
             .map_err(|e| ProxyError::Internal(format!("Unable to protect config file: {e}")))
     }
+}
+
+/// 只认真正的 loopback 绑定。`localhost` 也算——它解析到回环，且是常见写法。
+/// 拿不准的值（域名、`::ffff:0:0` 之类）一律当成非 loopback：这里判错的代价不对称，
+/// 多要一次 PROXY_API_KEY 只是麻烦，少要一次就是把额度送出去。
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// 展示用的 key 掩码。TUI 和 Web 设定页共用，避免两处各写一套、其中一处哪天漏出全量 key。
@@ -436,6 +461,44 @@ mod tests {
         assert!(is_cc_url("https://cc.freemodel.dev/v1").unwrap());
         assert!(!is_cc_url("https://cc.freemodel.dev.attacker/v1").unwrap());
         assert!(!is_cc_url("https://work.freemodel.dev/v1").unwrap());
+    }
+
+    #[test]
+    fn only_real_loopback_counts_as_loopback() {
+        for host in ["127.0.0.1", "127.1.2.3", "localhost", "LocalHost", "::1", "[::1]"] {
+            assert!(is_loopback_host(host), "{host} 应判为 loopback");
+        }
+        // 0.0.0.0 是「所有接口」，公网可达；域名和奇怪写法一律从严。
+        for host in ["0.0.0.0", "::", "192.168.1.10", "140.83.33.142", "example.com", ""] {
+            assert!(!is_loopback_host(host), "{host} 不应判为 loopback");
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_proxy_api_key_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let env_with = |host: &str, key: &str| {
+            HashMap::from([
+                ("PROXY_HOST".to_string(), host.to_string()),
+                ("PROXY_API_KEY".to_string(), key.to_string()),
+                ("PROXY_DEFAULT_PROJECT".to_string(), path.clone()),
+            ])
+        };
+
+        // 这就是 140.83.33.142 那台的形态：镜像绑 0.0.0.0，PROXY_API_KEY 空 → 必须拒绝启动。
+        let err = Config::load_with_env(root.path(), &env_with("0.0.0.0", ""))
+            .expect_err("绑 0.0.0.0 且无 key 必须启动失败");
+        assert!(
+            err.to_string().contains("PROXY_API_KEY"),
+            "报错要指明缺什么: {err}"
+        );
+        // 只有空白也不算设置了。
+        assert!(Config::load_with_env(root.path(), &env_with("0.0.0.0", "   ")).is_err());
+
+        // 设了 key 就放行；绑 loopback 时不设 key 也放行（只有本机能连）。
+        assert!(Config::load_with_env(root.path(), &env_with("0.0.0.0", "strong-random")).is_ok());
+        assert!(Config::load_with_env(root.path(), &env_with("127.0.0.1", "")).is_ok());
     }
 
     #[test]

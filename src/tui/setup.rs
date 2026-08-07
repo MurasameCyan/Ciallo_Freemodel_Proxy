@@ -173,6 +173,9 @@ mod tests {
         );
         environment.insert("PROXY_HOST".into(), host.into());
         environment.insert("PROXY_PORT".into(), "40589".into());
+        // 这里测的是 URL 显示。绑非 loopback 时配置校验强制要求 PROXY_API_KEY，
+        // 所以给一个占位值，免得 0.0.0.0 / :: 这两个用例卡在校验上。
+        environment.insert("PROXY_API_KEY".into(), "test-proxy-key".into());
         Config::load_with_env(Path::new("/tmp"), &environment).unwrap()
     }
 

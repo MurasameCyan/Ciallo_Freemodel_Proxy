@@ -208,7 +208,7 @@ cc 路线只用到前四项，`WORKBUDDY_*` 全部无关：
 | `FREEMODEL_TRANSPORT` | 按 host 自动推断 | `cc.freemodel.dev` → `cc_anthropic`，`work.freemodel.dev` → `workbuddy_acp`，其它 → `http` |
 | `FREEMODEL_API_KEY` | 空 | cc 与 http 路线的上游凭据；cc 路线必填 |
 | `FREEMODEL_PROMPT_GUARD` | `true` | 在客户端 `system` 后追加一句压制上游注入 prompt 的话；`false` 完全不加 |
-| `PROXY_API_KEY` | 空 | 代理自身 Bearer 鉴权，监听非 loopback 时必填 |
+| `PROXY_API_KEY` | 空 | 代理自身 Bearer 鉴权。绑非 loopback 时**不设就拒绝启动**；镜像固定绑 `0.0.0.0`，所以容器部署一律必填 |
 | `PROXY_HOST` | `127.0.0.1` | 代理监听地址 |
 | `PROXY_PORT` | `40589` | 代理监听端口 |
 | `PROXY_SESSION_STORE` | `/data/sessions.json` | 代理会话元数据 |
@@ -292,7 +292,7 @@ bash test/test-cc-smoke.sh
 PROXY_API_KEY=强随机值
 ```
 
-并把 Compose 中 `PROXY_HOST` 改为 `0.0.0.0`，同时把 `ports:` 的 `127.0.0.1:` 前缀去掉。此时 `PROXY_API_KEY` 不是可选项：代理持有你的上游 key，无鉴权暴露等于把 key 借给同网段任何人。必须同时配置防火墙，不要暴露到公网。
+并把 `PROXY_BIND` 改为 `0.0.0.0`。此时 `PROXY_API_KEY` 不是可选项，而是启动条件：镜像绑 `0.0.0.0`，没设它代理会直接拒绝启动并说明原因。这一条由代码强制，不靠你记得——空 key 在代码里等于关闭鉴权，而代理持有你的上游 key，无鉴权暴露等于把额度和 `/setup/key` 的写入权限交给所有能连上的人。必须同时配置防火墙，不要暴露到公网。
 
 ## direct HTTP 回退模式
 
@@ -307,6 +307,17 @@ FREEMODEL_API_KEY=你的fe_key
 该模式按 OpenAI 协议原样转发，不做 Anthropic 转换，也不使用 WorkBuddy gateway。
 
 ## 故障排查
+
+### 容器拒绝启动，日志说 `PROXY_HOST=0.0.0.0 不是 loopback，必须同时设置 PROXY_API_KEY`
+
+这不是故障，是安全闸门。空 `PROXY_API_KEY` 在代码里等于**关闭鉴权**，而镜像固定绑 `0.0.0.0`，两者相加就是把你的上游额度和 `/setup/key` 写入权限交给所有能连上这个端口的人。在 `.env` 里设一个强随机值即可：
+
+```bash
+openssl rand -hex 24   # 把输出填进 .env 的 PROXY_API_KEY
+docker compose up -d
+```
+
+客户端此后都要带 `Authorization: Bearer <PROXY_API_KEY>`。**如果你在设置它之前就已经把端口暴露过**，那段时间任何人都能用你的 key，应当去 Freemodel 后台轮换 `FREEMODEL_API_KEY`，再用 `/setup` 页面填入新的。
 
 ### `The requested image's platform (linux/amd64) does not match the detected host platform`
 
