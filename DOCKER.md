@@ -291,6 +291,30 @@ FREEMODEL_API_KEY=你的fe_key
 
 ## 故障排查
 
+### `The requested image's platform (linux/amd64) does not match the detected host platform`
+
+早期镜像只发了 `linux/amd64`。现在 `:latest` / `:beta` 是含 `linux/amd64` + `linux/arm64` 的 manifest list，重新拉一次即可：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Docker 会按本机架构自己选层，不需要 `--platform`。如果还是看到这句警告，说明本地缓存的是旧的单架构镜像：
+
+```bash
+docker rmi ghcr.io/murasamecyan/ciallo_freemodel_proxy:latest
+docker compose pull
+```
+
+确认拉到的是多架构镜像：
+
+```bash
+docker buildx imagetools inspect ghcr.io/murasamecyan/ciallo_freemodel_proxy:latest
+```
+
+应当能看到 `linux/amd64` 与 `linux/arm64` 两条。急用又不想等的话，`docker compose build` 在本机直接编，出来的就是本机架构。
+
 ### cc 路线返回 401 `Invalid token`
 
 `FREEMODEL_API_KEY` 为空、写错或已失效。用 `docker exec -it freemodel-proxy freemodel-workbuddy-proxy key set` 重新写入后 `docker compose restart`。日志和 issue 里不要粘贴 key 本身。
@@ -335,11 +359,17 @@ docker exec freemodel-proxy curl -sS http://127.0.0.1:40589/proxy/diagnostics
 
 ## GitHub Actions 自动发布
 
-推送 `beta` 后，workflow 构建 `linux/amd64` 并发布：
+推送 `beta` 后，workflow 发布同时包含 `linux/amd64` 和 `linux/arm64` 的 manifest list：
 
 - `ghcr.io/murasamecyan/ciallo_freemodel_proxy:beta`
 - `ghcr.io/murasamecyan/ciallo_freemodel_proxy:latest`
 
+两种架构各在自己的原生 runner 上构建（amd64 用 `ubuntu-latest`，arm64 用 `ubuntu-24.04-arm`），各自跑完冒烟测试后按 digest 推送、不带 tag，最后合成一个 manifest list 才第一次打 tag。因此不存在「latest 只覆盖一半架构」的中间态。CI 最后一步会 inspect 每个 tag 的 manifest，少任何一个架构就直接失败。
+
+arm64 不走 QEMU 模拟：模拟要把整棵 Rust 依赖树重编一遍，耗时以小时计。原生 arm64 runner 对 public 仓库免费。
+
 workflow 使用 `${GITHUB_REPOSITORY,,}` 将仓库名转换为 GHCR 要求的小写。首次发布后需在 GitHub Package settings 将容器包设为 Public。
+
+`:codebuddy-p0` 是例外，只发 `linux/amd64`——它额外打包了官方 CodeBuddy CLI，而那只是一道登录闸门实验。arm64 用户走 `:latest`。
 
 构建过程不读取 `scr/key.txt`，也没有密钥 build arg。`.dockerignore` 明确排除 `key.txt`、`.env`、`config.json` 和常见私钥格式。

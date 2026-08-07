@@ -40,6 +40,9 @@ jobs:
         with:
           context: .
           file: Dockerfile.codebuddy-p0
+          # P0 刻意只发 amd64。它比主镜像多装一个官方 CodeBuddy CLI（npm 全局包，
+          # 未验证是否带 arm64 原生依赖），而 P0 本身只是一道登录闸门实验。
+          # 主镜像 docker-build.yml 是多架构的，arm64 用户走那条线。
           platforms: linux/amd64
           load: true
           push: false
