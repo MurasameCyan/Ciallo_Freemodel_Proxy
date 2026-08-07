@@ -20,3 +20,10 @@ grep -Fq '127.0.0.1:44741:44741' "$COMPOSE"
 grep -Fq 'codebuddy-p0-data:/data' "$COMPOSE"
 ! grep -Fq 'network_mode: host' "$COMPOSE"
 ! grep -Eq 'FREEMODEL_API_KEY:|CODEBUDDY_AUTH_TOKEN:|CODEBUDDY_API_KEY:' "$COMPOSE"
+
+WORKFLOW="$ROOT/.github/workflows/docker-codebuddy-p0.yml"
+[[ -f "$WORKFLOW" ]]
+grep -Fq 'Dockerfile.codebuddy-p0' "$WORKFLOW"
+grep -Fq 'codebuddy-p0' "$WORKFLOW"
+! grep -Eq 'value=(beta|latest)' "$WORKFLOW"
+! grep -Eq 'FREEMODEL_API_KEY|CODEBUDDY_AUTH_TOKEN|CODEBUDDY_API_KEY' "$WORKFLOW"
