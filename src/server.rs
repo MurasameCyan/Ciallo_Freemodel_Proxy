@@ -794,6 +794,9 @@ async fn send_upstream(request: reqwest::RequestBuilder) -> Result<reqwest::Resp
 /// `Maximum number of running container instances exceeded`，与账号配额无关且会随机
 /// 发生，因此换后端重试而不是把 500 抛给客户端。`payload` 按候选后端名重新生成，
 /// 因为要换的正是 model 字段。
+///
+/// 每次重试前退避：实测容器池是网关级上限，换 model 并不会腾出实例，真正让请求
+/// 成功的是等一会儿。零间隔连打三次只是把同一个满池撞三遍。
 async fn cc_upstream(
     s: &AppState,
     model: &str,
@@ -811,6 +814,9 @@ async fn cc_upstream(
     let chain = cc::fallback_chain(model);
     let last = chain.len().saturating_sub(1);
     for (index, candidate) in chain.iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(cc::pool_backoff(index)).await;
+        }
         let response = send_upstream(
             s.client
                 .post(&url)

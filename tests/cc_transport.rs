@@ -1,8 +1,9 @@
 use freemodel_workbuddy_proxy::cc::{
     CC_BACKENDS, CcEvent, fallback_chain, is_pool_exhausted, parse_cc_event, passthrough_request,
-    prompt_guard, to_anthropic_request, to_openai_completion, to_openai_usage,
+    pool_backoff, prompt_guard, to_anthropic_request, to_openai_completion, to_openai_usage,
 };
 use serde_json::{Value, json};
+use std::time::Duration;
 
 #[test]
 fn system_messages_move_to_top_level_and_join() {
@@ -92,6 +93,16 @@ fn only_container_pool_exhaustion_is_retryable() {
         "Failed to start container: Maximum number of running container instances exceeded. Try again later"
     ));
     assert!(!is_pool_exhausted("{\"error\":\"Unauthorized - Invalid token\"}"));
+}
+
+#[test]
+fn retries_wait_because_the_pool_is_gateway_wide() {
+    // 首次请求不等；换后端并不腾出实例，零间隔重试只会再撞一次满池。
+    assert_eq!(pool_backoff(0), Duration::ZERO);
+    assert!(pool_backoff(1) >= Duration::from_secs(1));
+    assert!(pool_backoff(2) > pool_backoff(1));
+    // 有上限，否则最长的链会把客户端拖过读超时。
+    assert!(pool_backoff(99) <= Duration::from_secs(6));
 }
 
 #[test]

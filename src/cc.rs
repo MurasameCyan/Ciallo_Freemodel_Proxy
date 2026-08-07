@@ -31,6 +31,15 @@ pub fn is_pool_exhausted(body: &str) -> bool {
     body.contains("Maximum number of running container instances exceeded")
 }
 
+/// 第 `index` 次重试前的等待时长（`index` 从 1 起，0 是首次请求不等待）。
+///
+/// 容器池是网关级上限，换 model 并不会腾出实例，真正让请求成功的是等一会儿：
+/// 实测零间隔连打必然三连撞满池，退避几秒后同一个请求就能拿到 200。
+/// 单次上限 6 秒，最长的一条链（请求名不在后端表里时共 4 个候选）最坏多等 12 秒。
+pub fn pool_backoff(index: usize) -> std::time::Duration {
+    std::time::Duration::from_secs((2 * index as u64).min(6))
+}
+
 /// 上游容器在客户端 system 之前注入了自己的 agent harness prompt（实测身份在 Kiro 与
 /// Claude Code 之间随容器变化），它不计入 usage，也无法从客户端删除：system 覆盖、
 /// user 轮尾部指令、预填 assistant 轮、显式「忽略先前指令」的元指令全部无效。

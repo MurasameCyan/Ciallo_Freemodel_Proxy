@@ -31,7 +31,9 @@ docker compose restart
 
 可用模型只有三个真实后端：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`，`/v1/models` 在这个 transport 下只报这三个。其它 Claude 别名（如 `claude-sonnet-5`）会被上游静默改换成别的后端，代理按 `message_start.model` 把真实后端名回显给客户端，因此响应里的 `model` 可能和你请求的不一样，这是上游行为而不是代理改写。非 `claude-*` 的名字（如客户端默认的 `gpt-4o`）上游不认，代理会直接用 `claude-opus-5` 起步。
 
-上游是共享容器池，占满时返回 500 `Maximum number of running container instances exceeded`，与账号配额无关且随机发生。代理遇到这个错误会沿 `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001` 换后端重试，只有全部失败才回 502。4xx（含 401 key 无效）不重试。
+上游是共享容器池，占满时返回 500 `Maximum number of running container instances exceeded`，与账号配额无关且随机发生。代理遇到这个错误会沿 `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001` 换后端重试，每次重试前退避 2/4/6 秒，只有全部失败才回 502。4xx（含 401 key 无效）不重试。
+
+退避不能省：这个池是**网关级**上限，换 model 并不会腾出实例，真正让请求成功的是等一会儿。实测零间隔连打必然三连撞满池，退避几秒后同一个请求就能拿到 200。因此单个请求最坏会多花十几秒，这是刻意的。
 
 每次响应都带 `usage`：`prompt_tokens` 含缓存读取，`prompt_tokens_details.cached_tokens` 单列，流式在 finish chunk 上给。用它核对实际消耗，不要依赖官方后台的用量展示。走 `/v1/messages` 时 usage 是上游原样的 Anthropic 形状（`input_tokens` / `output_tokens` / `cache_read_input_tokens`）。
 

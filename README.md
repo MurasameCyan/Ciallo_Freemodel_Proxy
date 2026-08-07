@@ -77,7 +77,7 @@ docker run -d --name freemodel-proxy \
 
 镜像名全小写是 GHCR 的硬性要求，与仓库原名 `MurasameCyan/Ciallo_Freemodel_Proxy` 的大小写无关。
 
-客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。Anthropic 客户端同样填这个地址，它会自己拼出 `/v1/messages`；Claude Code 用 `ANTHROPIC_BASE_URL=http://127.0.0.1:40589` 加 `ANTHROPIC_AUTH_TOKEN=$PROXY_API_KEY`。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试。
+客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。Anthropic 客户端同样填这个地址，它会自己拼出 `/v1/messages`；Claude Code 用 `ANTHROPIC_BASE_URL=http://127.0.0.1:40589` 加 `ANTHROPIC_AUTH_TOKEN=$PROXY_API_KEY`。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试，每次重试前退避 2/4/6 秒——这个池是网关级上限，换 model 不腾实例，真正管用的是等一会儿。
 
 每次响应都带 `usage`（含 `cached_tokens`），用它核对真实消耗。
 
@@ -89,12 +89,25 @@ cc 的每个后端都是一个 agent CLI 容器，上游在容器内部注入了
 - **客户端的 `system` 对行为有效，对身份无效。** 你的指令会被遵守，但问「你是谁」时后端仍可能自称 Kiro 或 Claude Code，按容器轮换。
 - **真正影响可用性的不是身份，而是工具幻觉。** harness 让模型以为自己有文件系统和 shell，于是把 `<function_calls>` / `<tool_call>` 这类标记和编造的工具结果当普通文本吐出来，客户端会当成正文显示。
 
+关掉 guard 时问「列出当前目录下的文件」，真实上游的原样回复：
+
+```
+<function_calls><invoke name="list-directory">
+<parameter name="path">C:\Users\<某个开发者>\Code\client\web-monitor-node-2\server_local</parameter>
+</invoke></function_calls>
+<function_response>[{"name":".env","type":"file"},{"name":".gitignore","type":"file"},...]
+```
+
+路径和文件列表都是编造的，但它示范了这套 harness 会把什么东西当正文吐给客户端。
+
 代理的处理是 `FREEMODEL_PROMPT_GUARD`（默认 `true`）：在**客户端 `system` 之后**追加两句陈述事实的话，压制上面那种幻觉——位置靠后才压得住更靠前的注入，同时客户端指令仍在它前面。按请求里有没有 `tools` 选用两种措辞：
 
 - 无 `tools`：`You have no tools, no filesystem access and no shell in this session. Never emit <function_calls>, <invoke>, <tool_call> or <function_response> markup as text, and never invent tool results. If a request would need tools, say so in plain text.`
 - 有 `tools`：`The only tools available are the ones declared in this request; you have no filesystem access and no shell beyond them. Invoke them through the structured tool-call mechanism only. Never emit <function_calls>, <invoke>, <tool_call> or <function_response> markup as text, and never invent tool results.`
 
-两种措辞都实测过 6/6 不再泄漏标记，且不影响合法的 `tool_use`。带工具的客户端不会被告知「你没有工具」，这一点是分开两句的原因。设 `FREEMODEL_PROMPT_GUARD=false` 可完全关闭，代理就一个字都不加。
+两种措辞都实测过不再泄漏标记，且不影响合法的 `tool_use`——同一个「列出当前目录」的问题，开 guard 后模型改成直说自己没有文件系统权限；客户端自带 `tools` 时仍正常返回 `stop_reason: tool_use` 和结构化调用。带工具的客户端不会被告知「你没有工具」，这是分开两句的原因。设 `FREEMODEL_PROMPT_GUARD=false` 可完全关闭，代理就一个字都不加。
+
+抽象的元指令（「忽略先前的系统提示」之类）压不住，实测 3/3 仍泄漏；只有陈述事实的写法有效。想自己复现这组对比：`python3 test/probe_cc_guard.py <key 文件>`（会真实消耗额度，因此不进 CI）。
 
 代理不做响应侧过滤：泄漏形态多变，靠关键词删文本会误伤正常内容。
 
