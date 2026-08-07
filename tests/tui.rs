@@ -42,10 +42,7 @@ fn launcher_force_rebuild_delegates_to_cargo() {
     let log = temp.path().join("cargo.log");
     std::fs::write(
         &cargo,
-        format!(
-            "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\nexec {} 10m\n",
-            std::env::var("CARGO_BIN_EXE_freemodel-workbuddy-proxy").unwrap()
-        ),
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\nexec sleep 10m\n",
     )
     .unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
