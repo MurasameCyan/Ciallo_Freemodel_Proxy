@@ -1,0 +1,19 @@
+services:
+  freemodel-proxy:
+    image: ghcr.io/${IMAGE_REPO:-murasamecyan/ciallo_freemodel_proxy}:codebuddy-p0
+    build:
+      context: .
+      dockerfile: Dockerfile.codebuddy-p0
+    container_name: ciallo-codebuddy-p0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:40589:40589"
+      - "127.0.0.1:44741:44741"
+    environment:
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+    volumes:
+      - codebuddy-p0-data:/data
+      - ./workspace:/workspace
+
+volumes:
+  codebuddy-p0-data:
