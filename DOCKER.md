@@ -1,8 +1,45 @@
 # Docker 部署指南
 
-## 工作原理
+## CodeBuddy P0 免宿主安装实验
 
-`https://work.freemodel.dev` 不是可用普通 Bearer 请求直接调用的公开 OpenAI 端点。它要求官方 WorkBuddy 客户端，通过本机 CodeBuddy ACP gateway 完成请求。
+`:codebuddy-p0` 是独立实验标签，在同一 Linux 容器内运行官方 CodeBuddy Code 2.133.0 gateway 和 Rust 代理。它只验证纯 Docker 官方登录是否成立，不会覆盖 `:beta` 或 `:latest`；稳定版继续使用宿主机已登录的 external gateway。
+
+```bash
+docker pull ghcr.io/murasamecyan/ciallo_freemodel_proxy:codebuddy-p0
+docker compose -f docker-compose.codebuddy-p0.yml up -d
+docker exec -it ciallo-codebuddy-p0 codebuddy
+```
+
+在容器内官方 CLI 输入 `/login`，按官方流程在浏览器完成登录。不要设置 `CODEBUDDY_API_KEY=fe_...` 或 `CODEBUDDY_AUTH_TOKEN=fe_...`：Freemodel key 不是 CodeBuddy 登录凭据。
+
+登录后执行一条真实 ACP 请求：
+
+```bash
+RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
+```
+
+然后重启并重复请求，确认登录态确实保存在命名卷的 `/data/codebuddy-home`：
+
+```bash
+docker compose -f docker-compose.codebuddy-p0.yml restart
+RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
+```
+
+只有官方登录、真实 ACP 响应和重启后再次响应三项都通过，P0 才算验收成功。`docker compose -f docker-compose.codebuddy-p0.yml down -v` 会删除 `/data` volume 和登录态，不要把它当作普通停止命令。
+
+| 现象 | 含义 | 操作 |
+| --- | --- | --- |
+| `44741` health 不通 | gateway 未启动 | 在本机检查 `/data/runtime/codebuddy.log`；日志可能含敏感上下文，不得公开整份内容 |
+| 模型请求返回 401/403 | gateway 未登录或账号无权 | 运行官方 `/login`；不要设置 `CODEBUDDY_API_KEY=fe_...` |
+| 登录回调打不开 | P0 登录链路不成立 | 记录浏览器 URL 和错误码，但删除 token；停止 P1 |
+| 重启后再次要求登录 | 登录态未正确落在 `/data` | 不发布 P1，先定位官方实际配置目录 |
+| 返回 quota、capacity 或 `max_instances` | 官方账号限制 | 等待或清理官方实例；不要修改代理本地并发来冒充解决 |
+
+P0 的 `40589` 和 `44741` 只映射到宿主机 loopback，不应改为 LAN 或公网监听。若 P0 闸门失败，继续使用下述稳定版宿主 external gateway 方案。
+
+## 稳定版工作原理
+
+`https://work.freemodel.dev` 不是可用普通 Bearer 请求直接调用的公开 OpenAI 端点。稳定版要求官方 WorkBuddy 客户端，通过本机 CodeBuddy ACP gateway 完成请求。
 
 Docker 镜像因此采用以下边界：
 

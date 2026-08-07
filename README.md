@@ -4,6 +4,35 @@
 
 基于 Rust 的 OpenAI 兼容 Freemodel 代理服务。镜像由 GitHub Actions 自动构建并发布到 GHCR。
 
+## 🧪 免宿主安装实验（P0）
+
+`codebuddy-p0` 在 Linux 容器内置官方 CodeBuddy Code 2.133.0，目的是验证官方登录能否在纯 Docker 中完成并持久化。它不会把 Freemodel key 冒充 CodeBuddy 登录凭据，也不会覆盖稳定版标签。
+
+```bash
+docker compose -f docker-compose.codebuddy-p0.yml up -d
+```
+
+首次尝试打开 `http://127.0.0.1:44741`，或运行：
+
+```bash
+docker exec -it ciallo-codebuddy-p0 codebuddy
+```
+
+在官方 CLI 输入 `/login`。登录后运行：
+
+```bash
+RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
+```
+
+重启验收：
+
+```bash
+docker compose -f docker-compose.codebuddy-p0.yml restart
+RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
+```
+
+登录、真实 ACP 请求和重启后再次请求必须全部通过，P0 才算可行。不要执行 `docker compose -f docker-compose.codebuddy-p0.yml down -v`，除非你明确要删除 `/data` volume 和登录态。详细验收和故障含义见 [DOCKER.md](DOCKER.md)。
+
 ## 🐳 Docker 快速开始
 
 `work.freemodel.dev` 只接受官方 WorkBuddy 客户端。容器不会复制、伪造或打包私有认证，而是通过 ACP 复用宿主机**已登录且正在运行**的 WorkBuddy gateway。
