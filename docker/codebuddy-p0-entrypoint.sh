@@ -11,7 +11,22 @@ export PROXY_RUNTIME_DIR="${PROXY_RUNTIME_DIR:-$DATA_ROOT/runtime}"
 export WORKBUDDY_EXTERNAL_CWD="${WORKBUDDY_EXTERNAL_CWD:-$WORKSPACE}"
 export WORKBUDDY_ACP_URL="${WORKBUDDY_ACP_URL:-http://127.0.0.1:${CODEBUDDY_GATEWAY_PORT:-44741}}"
 
-mkdir -p "$HOME" "$PROXY_RUNTIME_DIR" "$WORKSPACE"
+# 挂载边界守卫：/workspace 通常是宿主机 bind mount，其属主由宿主机决定，
+# 常与容器内 uid 10001 不匹配。不早退的话失败会推迟到 CodeBuddy 写文件时，
+# 表现为难以归因的报错，直接污染 P0「登录能否在纯 Docker 完成」的结论。
+ensure_writable_dir() {
+  local dir=$1 hint=$2
+  mkdir -p "$dir" 2>/dev/null || true
+  if [[ ! -d "$dir" || ! -w "$dir" ]]; then
+    printf '致命错误：%s 不可写（容器内 uid=%s）。%s\n' "$dir" "$(id -u)" "$hint" >&2
+    exit 1
+  fi
+}
+
+ensure_writable_dir "$HOME" '删除并重建 codebuddy-p0-data volume 后重启容器。'
+ensure_writable_dir "$PROXY_RUNTIME_DIR" '删除并重建 codebuddy-p0-data volume 后重启容器。'
+ensure_writable_dir "$WORKSPACE" \
+  '在宿主机执行 mkdir -p ./workspace && sudo chown 10001:10001 ./workspace 后重启容器。'
 chmod 700 "$HOME" "$PROXY_RUNTIME_DIR"
 
 gateway_pid=

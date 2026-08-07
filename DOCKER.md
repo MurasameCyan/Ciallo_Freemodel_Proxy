@@ -29,6 +29,7 @@ RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
 
 | 现象 | 含义 | 操作 |
 | --- | --- | --- |
+| 容器启动即退出，日志有 `/workspace 不可写` | 宿主机 `./workspace` 属主与容器内 uid 10001 不匹配 | 按提示执行 `mkdir -p ./workspace && sudo chown 10001:10001 ./workspace`，再 `docker compose -f docker-compose.codebuddy-p0.yml up -d` |
 | `44741` health 不通 | gateway 未启动 | 在本机检查 `/data/runtime/codebuddy.log`；日志可能含敏感上下文，不得公开整份内容 |
 | 模型请求返回 401/403 | gateway 未登录或账号无权 | 运行官方 `/login`；不要设置 `CODEBUDDY_API_KEY=fe_...` |
 | 登录回调打不开 | P0 登录链路不成立 | 记录浏览器 URL 和错误码，但删除 token；停止 P1 |

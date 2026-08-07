@@ -252,5 +252,29 @@ wait_for_file "$CASE_DIR/codebuddy.stopped" 'gateway shutdown after proxy exit'
 wait_for_process_exit "$(<"$CASE_DIR/codebuddy.pid")" 'gateway after proxy exit'
 wait_for_process_exit "$(<"$CASE_DIR/proxy.pid")" 'exited proxy'
 
+begin_case unwritable-workspace
+chmod 500 "$CASE_DIR/workspace"
+if [[ "$(id -u)" == 0 || -w "$CASE_DIR/workspace" ]]; then
+  printf 'SKIP: 当前环境无法造出不可写目录（root 或 chmod 无效）\n' >&2
+  chmod 700 "$CASE_DIR/workspace"
+else
+  set +e
+  PATH="$TEMP/bin:$PATH" \
+  P0_CAPTURE="$CASE_DIR" \
+  PROXY_DATA_ROOT="$CASE_DIR/data" \
+  PROXY_WORKSPACE="$CASE_DIR/workspace" \
+  CODEBUDDY_GATEWAY_PORT=44741 \
+  PROXY_PORT=40589 \
+  "$ENTRYPOINT" >"$CASE_DIR/guard.out" 2>"$CASE_DIR/guard.err"
+  guard_status=$?
+  set -e
+  chmod 700 "$CASE_DIR/workspace"
+  (( guard_status != 0 )) || fail '不可写 workspace 未导致入口脚本退出'
+  grep -Fq "$CASE_DIR/workspace" "$CASE_DIR/guard.err" || fail '守卫未指出不可写目录'
+  grep -Fq 'chown 10001:10001' "$CASE_DIR/guard.err" || fail '守卫未给出可执行的修复提示'
+  [[ ! -f "$CASE_DIR/codebuddy.pid" ]] || fail '守卫失败前已启动 gateway'
+  [[ ! -f "$CASE_DIR/proxy.pid" ]] || fail '守卫失败前已启动 proxy'
+fi
+
 stop_case_processes
 CASE_DIR=
