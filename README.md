@@ -17,6 +17,8 @@ docker run -d --name freemodel-proxy \
 
 镜像名全小写是 GHCR 的硬性要求，与仓库名的大小写无关。
 
+> ⚠️ **首次发布后必做**：GHCR 包默认是 **private**，别人拉取会 404。到仓库页面右侧 **Packages** → 点进包 → **Package settings** → 改为 **Public**。
+
 启动后在客户端（Cursor、Continue、Codex CLI、OpenCode 等）填：
 
 - **Base URL**：`http://127.0.0.1:40589/v1`
