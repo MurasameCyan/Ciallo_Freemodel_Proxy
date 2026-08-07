@@ -16,6 +16,8 @@ services:
       # cc.freemodel.dev 只认 Bearer {FREEMODEL_API_KEY}，不需要任何登录态。
       FREEMODEL_BASE_URL: ${FREEMODEL_BASE_URL:-https://cc.freemodel.dev/v1}
       FREEMODEL_TRANSPORT: ${FREEMODEL_TRANSPORT:-cc_anthropic}
+      # 压制上游容器内注入的 harness 提示词；false 则只用客户端自带的提示词。
+      FREEMODEL_PROMPT_GUARD: ${FREEMODEL_PROMPT_GUARD:-true}
       # 你的 Freemodel key。留空可在启动后用 key set 写入 /data 卷。
       FREEMODEL_API_KEY: ${FREEMODEL_API_KEY:-}
       # 客户端调用本代理时使用的密钥，不要把 Freemodel key 直接发给客户端。

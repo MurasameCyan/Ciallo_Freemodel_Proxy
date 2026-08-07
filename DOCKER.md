@@ -2,7 +2,14 @@
 
 ## 推荐路线：cc.freemodel.dev，只要一个 key
 
-`https://cc.freemodel.dev/v1` 讲 Anthropic Messages 协议，鉴权只看 `Bearer {FREEMODEL_API_KEY}`，**不需要 CodeBuddy 登录，也不需要在宿主机装任何东西**。代理负责把客户端的 OpenAI Chat Completions 协议翻译成 Anthropic Messages 再翻译回来，因此现有客户端不用改。
+`https://cc.freemodel.dev/v1` 讲 Anthropic Messages 协议，鉴权只看 `Bearer {FREEMODEL_API_KEY}`，**不需要 CodeBuddy 登录，也不需要在宿主机装任何东西**。
+
+代理对客户端同时开放两种入站协议，不用二选一：
+
+- `POST /v1/chat/completions`：OpenAI Chat Completions。代理翻译成 Anthropic Messages 发上游，再翻译回来，现有 OpenAI 客户端不用改。
+- `POST /v1/messages`：Anthropic Messages。上游本来就讲这个协议，所以代理几乎原样转发——只改 `model`（外加启用时的 guard 句），`tools`、`tool_result`、图片、`cache_control`、`thinking` 全部原样送达，流式连 `event:` 事件名一起透传。Anthropic SDK 和 Claude Code 走这条路保真度最高。
+
+两个端点共用同一个降级链、同一份 `PROXY_API_KEY` 鉴权。
 
 这是 `docker-compose.yml` 和 `.env.example` 的默认配置：
 
@@ -26,7 +33,24 @@ docker compose restart
 
 上游是共享容器池，占满时返回 500 `Maximum number of running container instances exceeded`，与账号配额无关且随机发生。代理遇到这个错误会沿 `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001` 换后端重试，只有全部失败才回 502。4xx（含 401 key 无效）不重试。
 
-每次响应都带 `usage`：`prompt_tokens` 含缓存读取，`prompt_tokens_details.cached_tokens` 单列，流式在 finish chunk 上给。用它核对实际消耗，不要依赖官方后台的用量展示。
+每次响应都带 `usage`：`prompt_tokens` 含缓存读取，`prompt_tokens_details.cached_tokens` 单列，流式在 finish chunk 上给。用它核对实际消耗，不要依赖官方后台的用量展示。走 `/v1/messages` 时 usage 是上游原样的 Anthropic 形状（`input_tokens` / `output_tokens` / `cache_read_input_tokens`）。
+
+## 上游自带提示词能清到什么程度
+
+cc 的后端是 agent CLI 容器，上游在**容器内部**注入了自己的 harness 提示词。这决定了三件事：
+
+1. 客户端删不掉它。注入不在请求体里，没有字段能关；它也不计入 `usage`。
+2. 你的 `system` 对行为有效、对身份无效。指令会被遵守，但问「你是谁」时后端可能自称 Kiro 或 Claude Code，随容器轮换。
+3. 实际弄坏客户端的是工具幻觉：harness 让模型以为有文件系统和 shell，于是把 `<function_calls>` / `<tool_call>` 标记和编造的工具结果当正文输出。
+
+`FREEMODEL_PROMPT_GUARD`（默认 `true`）在客户端 `system` **之后**追加一句陈述事实的话来压制第 3 点。追加在后是有意的：越靠后越压得住更靠前的注入，同时客户端指令仍在它之前。按请求里有没有 `tools` 选措辞——带工具的客户端不会被告知「你没有工具」，否则会连合法的 `tool_use` 一起压掉。两种措辞实测 6/6 不再泄漏标记。
+
+```dotenv
+# 一个字都不加
+FREEMODEL_PROMPT_GUARD=false
+```
+
+代理不做响应侧过滤：泄漏形态多变，按关键词删文本会误伤正常内容。想验证当前行为，用 `/v1/messages` 发一句 `列出当前目录` 看它是否老实说自己没有 shell。
 
 ## CodeBuddy P0 免宿主安装实验
 
@@ -167,6 +191,7 @@ cc 路线只用到前四项，`WORKBUDDY_*` 全部无关：
 | `FREEMODEL_BASE_URL` | `https://cc.freemodel.dev/v1` | Compose 默认；改成 `work.freemodel.dev` 会强制要求 ACP |
 | `FREEMODEL_TRANSPORT` | 按 host 自动推断 | `cc.freemodel.dev` → `cc_anthropic`，`work.freemodel.dev` → `workbuddy_acp`，其它 → `http` |
 | `FREEMODEL_API_KEY` | 空 | cc 与 http 路线的上游凭据；cc 路线必填 |
+| `FREEMODEL_PROMPT_GUARD` | `true` | 在客户端 `system` 后追加一句压制上游注入 prompt 的话；`false` 完全不加 |
 | `PROXY_API_KEY` | 空 | 代理自身 Bearer 鉴权，监听非 loopback 时必填 |
 | `PROXY_HOST` | `127.0.0.1` | 代理监听地址 |
 | `PROXY_PORT` | `40589` | 代理监听端口 |
@@ -217,6 +242,13 @@ curl -sS http://127.0.0.1:40589/v1/chat/completions \
   -H "Authorization: Bearer local-proxy" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-opus-5","messages":[{"role":"user","content":"只回复 OK"}]}'
+
+# Anthropic 入站协议（Claude Code / Anthropic SDK 走这条）
+curl -sS http://127.0.0.1:40589/v1/messages \
+  -H "Authorization: Bearer local-proxy" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"只回复 OK"}]}'
 
 # WorkBuddy 路线：真实 ACP 对话
 curl -sS http://127.0.0.1:40589/v1/chat/completions \

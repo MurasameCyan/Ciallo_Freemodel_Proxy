@@ -20,6 +20,7 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub transport: String,
+    pub prompt_guard: bool,
     pub workbuddy_acp_url: String,
     pub workbuddy_acp_password: String,
     pub workbuddy_acp_cwd: PathBuf,
@@ -94,6 +95,8 @@ impl Config {
                 "https://work.freemodel.dev requires FREEMODEL_TRANSPORT=workbuddy_acp".into(),
             ));
         }
+        let prompt_guard = parse_bool(get("FREEMODEL_PROMPT_GUARD", Value::Bool(true)))
+            .ok_or_else(|| ProxyError::Invalid("FREEMODEL_PROMPT_GUARD must be a boolean".into()))?;
 
         let home = environment
             .get("HOME")
@@ -226,6 +229,7 @@ impl Config {
             base_url,
             api_key,
             transport,
+            prompt_guard,
             workbuddy_acp_url,
             workbuddy_acp_password: text("WORKBUDDY_ACP_PASSWORD", ""),
             workbuddy_acp_cwd: acp_cwd,
@@ -339,6 +343,17 @@ fn parse_usize(value: Value, name: &str) -> Result<usize, ProxyError> {
         .parse()
         .map_err(|_| ProxyError::Invalid(format!("{name} must be a positive integer")))
 }
+/// 环境变量只有字符串，config.json 里却可能是真正的 JSON 布尔，两种都要认。
+fn parse_bool(value: Value) -> Option<bool> {
+    if let Value::Bool(v) = value {
+        return Some(v);
+    }
+    match value_text(value).trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
 fn expand_path(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         home.to_path_buf()
@@ -423,5 +438,27 @@ mod tests {
         // 只报真实后端，客户端才不会选到必被上游改换的名字。
         assert_eq!(config.models[0].id, crate::cc::CC_BACKENDS[0]);
         assert_eq!(config.models.len(), crate::cc::CC_BACKENDS.len());
+        // 上游注入的 harness prompt 默认要压住，用户得显式关掉才不压。
+        assert!(config.prompt_guard);
+    }
+
+    #[test]
+    fn prompt_guard_accepts_string_and_json_booleans() {
+        assert_eq!(parse_bool(Value::Bool(false)), Some(false));
+        assert_eq!(parse_bool(Value::String("off".into())), Some(false));
+        assert_eq!(parse_bool(Value::String("1".into())), Some(true));
+        assert_eq!(parse_bool(Value::String("maybe".into())), None);
+    }
+
+    #[test]
+    fn prompt_guard_can_be_disabled_by_env() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let environment = HashMap::from([
+            ("FREEMODEL_PROMPT_GUARD".to_string(), "false".to_string()),
+            ("PROXY_DEFAULT_PROJECT".to_string(), path),
+        ]);
+        let config = Config::load_with_env(root.path(), &environment).unwrap();
+        assert!(!config.prompt_guard);
     }
 }

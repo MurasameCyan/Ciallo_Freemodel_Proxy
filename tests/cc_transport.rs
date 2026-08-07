@@ -1,8 +1,8 @@
 use freemodel_workbuddy_proxy::cc::{
-    CC_BACKENDS, CcEvent, fallback_chain, is_pool_exhausted, parse_cc_event, to_anthropic_request,
-    to_openai_completion, to_openai_usage,
+    CC_BACKENDS, CcEvent, fallback_chain, is_pool_exhausted, parse_cc_event, passthrough_request,
+    prompt_guard, to_anthropic_request, to_openai_completion, to_openai_usage,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn system_messages_move_to_top_level_and_join() {
@@ -14,7 +14,7 @@ fn system_messages_move_to_top_level_and_join() {
             {"role":"developer","content":"no emoji"},
         ]
     });
-    let out = to_anthropic_request(&body, "claude-opus-5");
+    let out = to_anthropic_request(&body, "claude-opus-5", false);
     assert_eq!(out["system"], json!("be terse\n\nno emoji"));
     assert_eq!(out["messages"].as_array().unwrap().len(), 1);
     assert_eq!(out["messages"][0]["role"], json!("user"));
@@ -28,19 +28,20 @@ fn multipart_content_flattens_to_text() {
             {"type":"text","text":"b"}
         ]}]
     });
-    let out = to_anthropic_request(&body, "claude-opus-5");
+    let out = to_anthropic_request(&body, "claude-opus-5", false);
     assert_eq!(out["messages"][0]["content"], json!("ab"));
 }
 
 #[test]
 fn max_tokens_is_always_present_for_anthropic() {
     // Anthropic 要求 max_tokens；OpenAI 客户端常常不发，缺省不能落空。
-    let out = to_anthropic_request(&json!({"messages":[]}), "claude-opus-5");
+    let out = to_anthropic_request(&json!({"messages":[]}), "claude-opus-5", false);
     assert_eq!(out["max_tokens"], json!(8192));
 
     let explicit = to_anthropic_request(
         &json!({"max_completion_tokens": 64, "messages": []}),
         "claude-opus-5",
+        false,
     );
     assert_eq!(explicit["max_tokens"], json!(64));
 }
@@ -48,14 +49,14 @@ fn max_tokens_is_always_present_for_anthropic() {
 #[test]
 fn empty_messages_still_produce_a_user_turn() {
     // Anthropic 拒绝空 messages，必须兜底，否则代理会把 400 转嫁给客户端。
-    let out = to_anthropic_request(&json!({"messages": []}), "claude-opus-5");
+    let out = to_anthropic_request(&json!({"messages": []}), "claude-opus-5", false);
     assert_eq!(out["messages"].as_array().unwrap().len(), 1);
     assert_eq!(out["messages"][0]["role"], json!("user"));
 }
 
 #[test]
 fn openai_stop_string_becomes_anthropic_stop_sequences() {
-    let out = to_anthropic_request(&json!({"stop":"END","messages":[]}), "claude-opus-5");
+    let out = to_anthropic_request(&json!({"stop":"END","messages":[]}), "claude-opus-5", false);
     assert_eq!(out["stop_sequences"], json!(["END"]));
 }
 
@@ -164,5 +165,83 @@ fn empty_text_delta_is_not_forwarded() {
     assert_eq!(
         parse_cc_event(r#"{"type":"content_block_delta","delta":{"text":""}}"#),
         None
+    );
+}
+
+#[test]
+fn guard_goes_after_the_client_system_not_before() {
+    // guard 要压的是更靠前的注入 prompt，位置越靠后越有效；客户端指令必须仍在它之前。
+    let out = to_anthropic_request(
+        &json!({"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}),
+        "claude-opus-5",
+        true,
+    );
+    let system = out["system"].as_str().unwrap();
+    assert!(system.starts_with("be terse"));
+    assert!(system.ends_with(prompt_guard(false)));
+}
+
+#[test]
+fn guard_is_the_whole_system_when_the_client_sends_none() {
+    let out = to_anthropic_request(&json!({"messages":[]}), "claude-opus-5", true);
+    assert_eq!(out["system"], json!(prompt_guard(false)));
+
+    // 关掉开关就完全不碰 system。
+    let bare = to_anthropic_request(&json!({"messages":[]}), "claude-opus-5", false);
+    assert_eq!(bare.get("system"), None);
+}
+
+#[test]
+fn passthrough_only_swaps_the_model() {
+    // 上游本来就讲 Anthropic，除 model 外任何字段都不该被改写或丢弃。
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"42"}]}],
+        "tools": [{"name":"now","input_schema":{"type":"object"}}],
+        "metadata": {"user_id":"u1"},
+        "thinking": {"type":"enabled","budget_tokens":1024}
+    });
+    let out = passthrough_request(&body, "claude-opus-5", false);
+    assert_eq!(out["model"], json!("claude-opus-5"));
+    for key in ["messages", "tools", "metadata", "thinking"] {
+        assert_eq!(out[key], body[key], "{key} 不应被改写");
+    }
+    assert_eq!(out.get("system"), None);
+}
+
+#[test]
+fn guard_picks_the_variant_matching_the_client_tools() {
+    // 客户端自带 tools 时说「你没有工具」会压掉合法的 tool_use。
+    let with_tools = passthrough_request(
+        &json!({"messages":[],"tools":[{"name":"now","input_schema":{}}]}),
+        "claude-opus-5",
+        true,
+    );
+    assert_eq!(with_tools["system"], json!(prompt_guard(true)));
+
+    let without = passthrough_request(&json!({"messages":[],"tools":[]}), "claude-opus-5", true);
+    assert_eq!(without["system"], json!(prompt_guard(false)));
+}
+
+#[test]
+fn guard_appends_a_block_when_system_is_a_block_array() {
+    // Anthropic 的 system 既可以是字符串也可以是块数组，后者常带 cache_control。
+    let client = json!([{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}]);
+    let out = passthrough_request(
+        &json!({"messages":[],"system":client.clone()}),
+        "claude-opus-5",
+        true,
+    );
+    let blocks = out["system"].as_array().unwrap();
+    assert_eq!(blocks[0], client[0], "客户端的块要原样保留");
+    assert_eq!(blocks[1], json!({"type":"text","text":prompt_guard(false)}));
+}
+
+#[test]
+fn guard_survives_a_non_object_body() {
+    // 上游会替我们拒绝非法请求体，代理不该在这里 panic。
+    assert_eq!(
+        passthrough_request(&json!("nonsense"), "claude-opus-5", true),
+        Value::String("nonsense".into())
     );
 }

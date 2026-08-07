@@ -1,5 +1,6 @@
 use crate::{
     acp::AcpTransport,
+    anthropic::{self, AnthropicStreamEncoder},
     cc,
     config::Config,
     error::{AcpError, ProxyError},
@@ -152,6 +153,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .route("/proxy/sessions", get(list_sessions).post(create_session))
         .route(
@@ -631,152 +633,356 @@ async fn chat(
     };
     direct_chat(&s, &headers, body, streaming, Some(&session)).await
 }
+/// Anthropic Messages 入站端点，让 Claude Code / Anthropic SDK 直接指向本代理。
+///
+/// cc 上游本来就讲 Anthropic，走近乎透传的 [`cc_messages`]；其余 transport 只讲
+/// OpenAI，于是在边界翻一次进、翻一次出，中间复用 [`chat`] 的整条分发链路
+/// （会话路由、ACP、直连 HTTP），而不是再长出一棵传输树。
+async fn messages(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !proxy_auth(&headers, &s.config) {
+        return proxy_auth_error();
+    }
+    if let Err(e) = anthropic::validate_messages_body(&body) {
+        return json_error(StatusCode::BAD_REQUEST, &e, "invalid_request_error");
+    }
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if s.config.transport == "cc_anthropic" {
+        // 客户端不给 model 时用最强后端起步，别绕道 OpenAI 别名——上游不认那些名字。
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| cc::CC_BACKENDS[0].to_string());
+        return cc_messages(&s, &body, &model, streaming).await;
+    }
+    let model = openai::normalize_model(body.get("model").and_then(Value::as_str));
+    let inner = chat(State(s), headers, Json(anthropic::to_openai_request(&body))).await;
+    if !inner.status().is_success() {
+        // 两边错误体形状一致（都是 `error.message` / `error.type`），透传即可。
+        return inner;
+    }
+    if streaming {
+        anthropic_stream(inner, model)
+    } else {
+        anthropic_json(inner, model).await
+    }
+}
+
+/// ACP 路径会带上会话归属头，翻译成 Anthropic 之后也要保住。
+fn copy_routing_headers(from: &HeaderMap, to: &mut HeaderMap) {
+    for name in ["x-workbuddy-session", "x-workbuddy-project"] {
+        if let Some(value) = from.get(name) {
+            to.insert(name, value.clone());
+        }
+    }
+}
+
+/// OpenAI chat.completion -> Anthropic message。
+async fn anthropic_json(inner: Response, model: String) -> Response {
+    let (parts, body) = inner.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_UPSTREAM_JSON_BYTES).await else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "Upstream response exceeded the maximum size",
+            "upstream_error",
+        );
+    };
+    let Ok(completion) = serde_json::from_slice::<Value>(&bytes) else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "Upstream returned invalid JSON",
+            "upstream_error",
+        );
+    };
+    let mut response = Json(anthropic::to_anthropic_message(&completion, &model)).into_response();
+    copy_routing_headers(&parts.headers, response.headers_mut());
+    response
+}
+
+/// OpenAI SSE chunk 流 -> Anthropic SSE 事件流。
+///
+/// 收尾统一交给 `encoder.finish`：它对已结束的流是空操作，所以正常结束、上游中断、
+/// 缺 `[DONE]` 都只会收到一份成对的 `content_block_stop` / `message_stop`。
+/// 例外是 `encoder.error`：它自己就是终结事件，之后不再补 `message_stop`，
+/// 否则会把截断的回复伪装成正常收尾的完整回复。
+fn anthropic_stream(inner: Response, model: String) -> Response {
+    let (parts, body) = inner.into_parts();
+    let mut body = body.into_data_stream();
+    let mut response = stream_response(
+        stream! {
+            let mut decoder = SseDecoder::default();
+            let mut encoder = AnthropicStreamEncoder::new(anthropic::message_id(), model);
+            let mut output_bytes = 0usize;
+            while let Some(chunk) = body.next().await {
+                let Ok(chunk) = chunk else {
+                    yield Ok(encoder.error("Upstream stream failed"));
+                    break;
+                };
+                if output_bytes.saturating_add(chunk.len()) > MAX_STREAM_OUTPUT_BYTES {
+                    yield Ok(encoder.error("Upstream response exceeded the maximum size"));
+                    break;
+                }
+                output_bytes += chunk.len();
+                let Ok(lines) = decoder.push(&chunk) else {
+                    yield Ok(encoder.error("Upstream stream decode failed"));
+                    break;
+                };
+                for line in lines {
+                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if payload == "[DONE]" {
+                        for event in encoder.finish(json!("end_turn"), None) {
+                            yield Ok(event);
+                        }
+                        break;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(payload) else { continue };
+                    if let Some(message) = value.pointer("/error/message").and_then(Value::as_str) {
+                        yield Ok(encoder.error(message));
+                        break;
+                    }
+                    for event in encoder.push(&value) {
+                        yield Ok(event);
+                    }
+                }
+                if encoder.is_finished() {
+                    break;
+                }
+            }
+            for event in encoder.finish(json!("end_turn"), None) {
+                yield Ok(event);
+            }
+        },
+        None,
+    );
+    copy_routing_headers(&parts.headers, response.headers_mut());
+    response
+}
+
 fn chat_chunk(id: &str, model: &str, delta: Value, finish: Value) -> Value {
     json!({"id":id,"object":"chat.completion.chunk","created":chrono::Utc::now().timestamp(),"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
 }
-/// cc.freemodel.dev 走 Anthropic Messages 协议，鉴权只需 `Bearer {FREEMODEL_API_KEY}`。
+/// 发一次上游请求，把连接层失败翻成客户端读得懂的 502 / 504。
+async fn send_upstream(request: reqwest::RequestBuilder) -> Result<reqwest::Response, Response> {
+    request.send().await.map_err(|e| {
+        json_error(
+            if e.is_timeout() {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            if e.is_timeout() {
+                "Upstream request timed out"
+            } else {
+                "Unable to connect to upstream"
+            },
+            "proxy_error",
+        )
+    })
+}
+
+/// 沿降级链请求 cc.freemodel.dev `/messages`，返回第一个成功的响应。
 ///
-/// 上游共享容器池占满时返回 500 `Maximum number of running container instances exceeded`，
-/// 与账号配额无关且会随机发生，因此沿降级链换后端重试，而不是把 500 抛给客户端。
-async fn cc_chat(s: &AppState, body: &Value, model: &str, streaming: bool) -> Response {
+/// 鉴权只需 `Bearer {FREEMODEL_API_KEY}`。上游共享容器池占满时返回 500
+/// `Maximum number of running container instances exceeded`，与账号配额无关且会随机
+/// 发生，因此换后端重试而不是把 500 抛给客户端。`payload` 按候选后端名重新生成，
+/// 因为要换的正是 model 字段。
+async fn cc_upstream(
+    s: &AppState,
+    model: &str,
+    payload: impl Fn(&str) -> Value,
+) -> Result<reqwest::Response, Response> {
     // 没有 key 时上游只会回一句含糊的 401，说清楚缺什么比透传更有用。
     if s.config.api_key.trim().is_empty() {
-        return json_error(
+        return Err(json_error(
             StatusCode::UNAUTHORIZED,
             "No Freemodel API key is configured. Set FREEMODEL_API_KEY or run `key set`.",
             "authentication_error",
-        );
+        ));
     }
     let url = format!("{}/messages", s.config.base_url.trim_end_matches('/'));
     let chain = cc::fallback_chain(model);
     let last = chain.len().saturating_sub(1);
     for (index, candidate) in chain.iter().enumerate() {
-        let payload = cc::to_anthropic_request(body, candidate);
-        let request = s
-            .client
-            .post(&url)
-            .header("anthropic-version", "2023-06-01")
-            .header(header::AUTHORIZATION, format!("Bearer {}", s.config.api_key))
-            .json(&payload);
-        let response = match request.send().await {
-            Ok(value) => value,
-            Err(e) => {
-                return json_error(
-                    if e.is_timeout() {
-                        StatusCode::GATEWAY_TIMEOUT
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    },
-                    if e.is_timeout() {
-                        "Upstream request timed out"
-                    } else {
-                        "Unable to connect to upstream"
-                    },
-                    "proxy_error",
-                );
-            }
-        };
+        let response = send_upstream(
+            s.client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header(header::AUTHORIZATION, format!("Bearer {}", s.config.api_key))
+                .json(&payload(candidate)),
+        )
+        .await?;
         let status = response.status();
-        if !status.is_success() {
-            let bytes = bounded_upstream_bytes(response).await.unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            // 容器池占满可换后端重试；4xx 是请求或密钥问题，重试无益。
-            if status.is_server_error() && cc::is_pool_exhausted(&text) && index < last {
-                continue;
-            }
-            return Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(bytes))
-                .unwrap();
+        if status.is_success() {
+            return Ok(response);
         }
-        if !streaming {
-            let bytes = match bounded_upstream_bytes(response).await {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "Upstream response exceeded the maximum size",
-                        "upstream_error",
-                    );
-                }
-            };
-            return match serde_json::from_slice::<Value>(&bytes) {
-                Ok(value) => Json(cc::to_openai_completion(&value, model)).into_response(),
-                Err(_) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "Upstream returned invalid JSON",
-                    "upstream_error",
-                ),
-            };
+        let bytes = bounded_upstream_bytes(response).await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        // 容器池占满可换后端重试；4xx 是请求或密钥问题，重试无益。
+        if status.is_server_error() && cc::is_pool_exhausted(&text) && index < last {
+            continue;
         }
-        let id = format!("chatcmpl-{}", &Uuid::new_v4().simple().to_string()[..24]);
-        let requested = model.to_string();
-        return stream_response(
-            stream! {
-                let mut decoder = SseDecoder::default();
-                let mut bytes = response.bytes_stream();
-                // 上游会静默改换模型，先用请求名占位，收到 message_start 后换成真实后端名。
-                let mut actual = requested.clone();
-                let mut output_bytes = 0usize;
-                let mut finished = false;
-                while let Some(chunk) = bytes.next().await {
-                    let Ok(chunk) = chunk else {
-                        yield Ok(sse::data(&json!({"error":{"message":"Upstream stream failed","type":"proxy_error","code":"proxy_stream_error"}})));
-                        break;
-                    };
-                    let Ok(lines) = decoder.push(&chunk) else {
-                        yield Ok(sse::data(&json!({"error":{"message":"Upstream stream decode failed","type":"proxy_error","code":"upstream_stream_error"}})));
-                        break;
-                    };
-                    for line in lines {
-                        let Some(payload) = line.strip_prefix("data:") else { continue };
-                        match cc::parse_cc_event(payload) {
-                            Some(cc::CcEvent::Model(name)) => actual = name,
-                            Some(cc::CcEvent::Text(text)) => {
-                                if output_bytes.saturating_add(text.len()) > MAX_STREAM_OUTPUT_BYTES {
-                                    yield Ok(sse::data(&json!({"error":{"message":"Upstream response exceeded the maximum size","type":"proxy_error","code":"upstream_stream_error"}})));
-                                    finished = true;
-                                    break;
-                                }
-                                output_bytes += text.len();
-                                yield Ok(sse::data(&chat_chunk(&id, &actual, json!({"content":text}), Value::Null)));
-                            }
-                            Some(cc::CcEvent::Finish(reason, usage)) => {
-                                let mut chunk = chat_chunk(&id, &actual, json!({}), reason);
-                                if !usage.is_null() {
-                                    chunk["usage"] = cc::to_openai_usage(&usage);
-                                }
-                                yield Ok(sse::data(&chunk));
-                                yield Ok(sse::done());
-                                finished = true;
-                                break;
-                            }
-                            Some(cc::CcEvent::Done) => {
-                                yield Ok(sse::done());
-                                finished = true;
-                                break;
-                            }
-                            None => {}
-                        }
-                    }
-                    if finished {
-                        break;
-                    }
-                }
-                if !finished {
-                    yield Ok(sse::done());
-                }
-            },
-            None,
-        );
+        return Err(Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap());
     }
-    json_error(
+    Err(json_error(
         StatusCode::BAD_GATEWAY,
         "All upstream backends were unavailable",
         "upstream_error",
+    ))
+}
+
+/// OpenAI 客户端 -> cc 上游：请求翻成 Anthropic，响应翻回 OpenAI。
+async fn cc_chat(s: &AppState, body: &Value, model: &str, streaming: bool) -> Response {
+    let response = match cc_upstream(s, model, |candidate| {
+        cc::to_anthropic_request(body, candidate, s.config.prompt_guard)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    if !streaming {
+        let bytes = match bounded_upstream_bytes(response).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream response exceeded the maximum size",
+                    "upstream_error",
+                );
+            }
+        };
+        return match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => Json(cc::to_openai_completion(&value, model)).into_response(),
+            Err(_) => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Upstream returned invalid JSON",
+                "upstream_error",
+            ),
+        };
+    }
+    let id = format!("chatcmpl-{}", &Uuid::new_v4().simple().to_string()[..24]);
+    let requested = model.to_string();
+    stream_response(
+        stream! {
+            let mut decoder = SseDecoder::default();
+            let mut bytes = response.bytes_stream();
+            // 上游会静默改换模型，先用请求名占位，收到 message_start 后换成真实后端名。
+            let mut actual = requested.clone();
+            let mut output_bytes = 0usize;
+            let mut finished = false;
+            while let Some(chunk) = bytes.next().await {
+                let Ok(chunk) = chunk else {
+                    yield Ok(sse::data(&json!({"error":{"message":"Upstream stream failed","type":"proxy_error","code":"proxy_stream_error"}})));
+                    break;
+                };
+                let Ok(lines) = decoder.push(&chunk) else {
+                    yield Ok(sse::data(&json!({"error":{"message":"Upstream stream decode failed","type":"proxy_error","code":"upstream_stream_error"}})));
+                    break;
+                };
+                for line in lines {
+                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    match cc::parse_cc_event(payload) {
+                        Some(cc::CcEvent::Model(name)) => actual = name,
+                        Some(cc::CcEvent::Text(text)) => {
+                            if output_bytes.saturating_add(text.len()) > MAX_STREAM_OUTPUT_BYTES {
+                                yield Ok(sse::data(&json!({"error":{"message":"Upstream response exceeded the maximum size","type":"proxy_error","code":"upstream_stream_error"}})));
+                                finished = true;
+                                break;
+                            }
+                            output_bytes += text.len();
+                            yield Ok(sse::data(&chat_chunk(&id, &actual, json!({"content":text}), Value::Null)));
+                        }
+                        Some(cc::CcEvent::Finish(reason, usage)) => {
+                            let mut chunk = chat_chunk(&id, &actual, json!({}), reason);
+                            if !usage.is_null() {
+                                chunk["usage"] = cc::to_openai_usage(&usage);
+                            }
+                            yield Ok(sse::data(&chunk));
+                            yield Ok(sse::done());
+                            finished = true;
+                            break;
+                        }
+                        Some(cc::CcEvent::Done) => {
+                            yield Ok(sse::done());
+                            finished = true;
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                if finished {
+                    break;
+                }
+            }
+            if !finished {
+                yield Ok(sse::done());
+            }
+        },
+        None,
     )
 }
+
+/// Anthropic 客户端 -> cc 上游：几乎原样转发。
+///
+/// 上游本来就讲 Anthropic，任何翻译都只会丢信息（tools、tool_result、图片、
+/// cache_control、thinking），因此非流式直接把上游 JSON 原样回给客户端，
+/// 流式把 SSE 字节原样透传——包括事件名，客户端 SDK 依赖它们。
+async fn cc_messages(s: &AppState, body: &Value, model: &str, streaming: bool) -> Response {
+    let response = match cc_upstream(s, model, |candidate| {
+        cc::passthrough_request(body, candidate, s.config.prompt_guard)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    if !streaming {
+        return match bounded_upstream_bytes(response).await {
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .unwrap(),
+            Err(_) => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Upstream response exceeded the maximum size",
+                "upstream_error",
+            ),
+        };
+    }
+    stream_response(
+        stream! {
+            let mut bytes = response.bytes_stream();
+            let mut output_bytes = 0usize;
+            while let Some(chunk) = bytes.next().await {
+                let Ok(chunk) = chunk else {
+                    yield Ok(anthropic::error_event("Upstream stream failed"));
+                    break;
+                };
+                if output_bytes.saturating_add(chunk.len()) > MAX_STREAM_OUTPUT_BYTES {
+                    yield Ok(anthropic::error_event("Upstream response exceeded the maximum size"));
+                    break;
+                }
+                output_bytes += chunk.len();
+                yield Ok(chunk);
+            }
+        },
+        None,
+    )
+}
+
 async fn direct_chat(
     s: &AppState,
     headers: &HeaderMap,
@@ -792,23 +998,9 @@ async fn direct_chat(
     if let Some(a) = auth(headers, &s.config) {
         req = req.header(header::AUTHORIZATION, a);
     }
-    let response = match req.send().await {
+    let response = match send_upstream(req).await {
         Ok(v) => v,
-        Err(e) => {
-            return json_error(
-                if e.is_timeout() {
-                    StatusCode::GATEWAY_TIMEOUT
-                } else {
-                    StatusCode::BAD_GATEWAY
-                },
-                if e.is_timeout() {
-                    "Upstream request timed out"
-                } else {
-                    "Unable to connect to upstream"
-                },
-                "proxy_error",
-            );
-        }
+        Err(error) => return error,
     };
     let status = response.status();
     if !status.is_success() {

@@ -7,7 +7,7 @@ use axum::{
     routing::post,
 };
 use freemodel_workbuddy_proxy::{
-    cc::CC_BACKENDS,
+    cc::{CC_BACKENDS, prompt_guard},
     config::Config,
     server::{AppState, router},
 };
@@ -87,6 +87,10 @@ async fn mock_cc(script: Vec<(StatusCode, &str, &str)>) -> (String, Upstream) {
 }
 
 fn cc_state(base_url: &str, api_key: &str) -> (tempfile::TempDir, AppState) {
+    cc_state_guarded(base_url, api_key, true)
+}
+
+fn cc_state_guarded(base_url: &str, api_key: &str, guard: bool) -> (tempfile::TempDir, AppState) {
     let root = tempdir().unwrap();
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -95,6 +99,7 @@ fn cc_state(base_url: &str, api_key: &str) -> (tempfile::TempDir, AppState) {
         ("FREEMODEL_BASE_URL".into(), base_url.to_string()),
         ("FREEMODEL_TRANSPORT".into(), "cc_anthropic".into()),
         ("FREEMODEL_API_KEY".into(), api_key.to_string()),
+        ("FREEMODEL_PROMPT_GUARD".into(), guard.to_string()),
         (
             "PROXY_DEFAULT_PROJECT".into(),
             project.to_string_lossy().to_string(),
@@ -178,7 +183,10 @@ async fn cc_chat_speaks_anthropic_upstream_and_openai_downstream() {
     assert_eq!(upstream.header(0, "anthropic-version"), "2023-06-01");
     let sent = &upstream.bodies()[0];
     assert_eq!(sent["model"], "claude-opus-5");
-    assert_eq!(sent["system"], "be terse");
+    // guard 默认开启，客户端的 system 仍在最前，压制句追加在后。
+    let system = sent["system"].as_str().unwrap();
+    assert!(system.starts_with("be terse"), "{system}");
+    assert!(system.ends_with(prompt_guard(false)), "{system}");
     assert_eq!(sent["messages"][0]["content"], "ping");
     assert!(sent["max_tokens"].is_u64());
     assert!(sent.get("stream").is_none(), "{sent}");
@@ -315,6 +323,115 @@ async fn responses_route_is_explicitly_unsupported_on_cc() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("/v1/chat/completions"), "{body}");
+    assert!(upstream.bodies().is_empty());
+}
+
+#[tokio::test]
+async fn messages_route_passes_anthropic_through_untranslated() {
+    let (base, upstream) =
+        mock_cc(vec![(StatusCode::OK, "application/json", ANTHROPIC_REPLY)]).await;
+    let (_root, state) = cc_state_guarded(&base, "test-key", false);
+    let request = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 128,
+        "system": [{"type":"text","text":"be terse"}],
+        "messages": [{"role":"user","content":[{"type":"text","text":"ping"}]}],
+        "tools": [{"name":"now","description":"clock","input_schema":{"type":"object"}}],
+        "thinking": {"type":"enabled","budget_tokens":1024}
+    });
+    let (status, body) = post_json(state, "/v1/messages", request.clone()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = &upstream.bodies()[0];
+    // 只有 model 该被换掉；其余字段翻译一次就会丢信息，必须原样到上游。
+    assert_eq!(sent["model"], "claude-sonnet-5");
+    for key in ["system", "messages", "tools", "thinking", "max_tokens"] {
+        assert_eq!(sent[key], request[key], "{key} 不应被改写");
+    }
+    // 响应也原样回客户端，客户端 SDK 依赖 Anthropic 的字段形状。
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        serde_json::from_str::<Value>(ANTHROPIC_REPLY).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn messages_route_guards_with_the_tool_aware_variant() {
+    let (base, upstream) =
+        mock_cc(vec![(StatusCode::OK, "application/json", ANTHROPIC_REPLY)]).await;
+    let (_root, state) = cc_state(&base, "test-key");
+    let (status, body) = post_json(
+        state,
+        "/v1/messages",
+        json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"ping"}],
+            "tools": [{"name":"now","input_schema":{"type":"object"}}]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 客户端自带 tools 时说「你没有工具」会压掉合法的 tool_use。
+    assert_eq!(upstream.bodies()[0]["system"], json!(prompt_guard(true)));
+}
+
+#[tokio::test]
+async fn messages_route_streams_anthropic_events_verbatim() {
+    let events = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"model":"claude-fable-5"}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+        "\n\nevent: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let (base, upstream) = mock_cc(vec![(StatusCode::OK, "text/event-stream", events)]).await;
+    let (_root, state) = cc_state(&base, "test-key");
+    let (status, body) = post_json(
+        state,
+        "/v1/messages",
+        json!({
+            "model":"claude-opus-5","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"ping"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.bodies()[0]["stream"], true);
+    // 事件名也要保留，Anthropic SDK 按 `event:` 分派。
+    assert_eq!(body, events, "{body}");
+}
+
+#[tokio::test]
+async fn messages_route_without_a_model_starts_from_a_real_backend() {
+    let (base, upstream) =
+        mock_cc(vec![(StatusCode::OK, "application/json", ANTHROPIC_REPLY)]).await;
+    let (_root, state) = cc_state(&base, "test-key");
+    // 缺 model 时不能绕道 OpenAI 别名，上游不认 gpt-*。
+    let (status, body) = post_json(
+        state,
+        "/v1/messages",
+        json!({"max_tokens":64,"messages":[{"role":"user","content":"ping"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.bodies()[0]["model"], CC_BACKENDS[0]);
+}
+
+#[tokio::test]
+async fn messages_route_rejects_an_empty_conversation() {
+    let (base, upstream) =
+        mock_cc(vec![(StatusCode::OK, "application/json", ANTHROPIC_REPLY)]).await;
+    let (_root, state) = cc_state(&base, "test-key");
+    let (status, body) = post_json(state, "/v1/messages", json!({"messages":[]})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_request_error"), "{body}");
     assert!(upstream.bodies().is_empty());
 }
 

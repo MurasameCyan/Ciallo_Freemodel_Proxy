@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod anthropic;
 pub mod cc;
 pub mod config;
 pub mod error;

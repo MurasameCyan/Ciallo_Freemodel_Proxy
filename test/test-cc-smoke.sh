@@ -71,4 +71,21 @@ assert ids == [
 print("OK: /v1/models 只报真实 cc 后端:", ", ".join(ids))
 PY
 
+# Anthropic 入站端点也必须在镜像里存在且同样受鉴权保护。
+# 空 messages 在校验阶段就被拒，不会打上游，因此不花额度。
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/messages" \
+  -H 'Content-Type: application/json' -d '{"messages":[]}')
+if [[ "$code" != "401" ]]; then
+    echo "FAIL: 未鉴权的 /v1/messages 返回 $code，应为 401" >&2
+    exit 1
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/messages" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{"messages":[]}')
+if [[ "$code" != "400" ]]; then
+    echo "FAIL: 空 messages 的 /v1/messages 返回 $code，应为 400（路由缺失会是 404/405）" >&2
+    exit 1
+fi
+echo "OK: /v1/messages 已挂载且受鉴权保护"
+
 echo "cc 冒烟测试通过。"
+

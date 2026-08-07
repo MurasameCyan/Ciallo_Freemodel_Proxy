@@ -567,3 +567,140 @@ async fn direct_responses_consumes_unterminated_done_line() {
     );
     assert_eq!(body.matches("event: response.failed").count(), 0, "{body}");
 }
+
+#[tokio::test]
+async fn messages_route_bridges_anthropic_clients_onto_the_openai_upstream() {
+    let (base, recorded) = recording_upstream().await;
+    let (_root, state) = direct_state(&base);
+    let (status, headers, body) = request_stream_with_headers(
+        state,
+        "/v1/messages",
+        &json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "system": [{"type":"text","text":"be terse"}],
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"hello"}]},
+                {"role":"assistant","content":"hi"},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"42"}]}
+            ],
+            "stop_sequences": ["STOP"],
+            "tools": [{"name":"now","description":"clock","input_schema":{"type":"object"}}]
+        })
+        .to_string(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let upstream = recorded.body.lock().unwrap().clone().unwrap();
+    // system 提到最前变成 system 角色，块数组拍平成文本。
+    assert_eq!(
+        upstream["messages"],
+        json!([
+            {"role":"system","content":"be terse"},
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi"},
+            {"role":"user","content":"42"}
+        ])
+    );
+    assert_eq!(upstream["model"], "gpt-5.6-sol");
+    assert_eq!(upstream["stop"], json!(["STOP"]));
+    assert_eq!(upstream["tools"][0]["function"]["name"], "now");
+    assert_eq!(upstream["tools"][0]["function"]["parameters"], json!({"type":"object"}));
+
+    // 回给客户端的必须是 Anthropic 形状，而不是 OpenAI 的 choices。
+    let out: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(out["type"], "message");
+    assert_eq!(out["role"], "assistant");
+    assert_eq!(out["content"], json!([{"type":"text","text":"recorded"}]));
+    assert_eq!(out["stop_reason"], "end_turn");
+    assert_eq!(out["usage"]["input_tokens"], 2);
+    assert_eq!(out["usage"]["output_tokens"], 1);
+    assert!(out.get("choices").is_none(), "{body}");
+    // 会话归属头在翻译后也要保住。
+    assert!(headers.contains_key("x-workbuddy-session"), "{headers:?}");
+}
+
+#[tokio::test]
+async fn messages_route_streams_anthropic_events_for_openai_upstreams() {
+    let base = mock_upstream(
+        "data: {\"model\":\"gpt-5.6-sol\",\"choices\":[{\"delta\":{\"content\":\"He\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+    )
+    .await;
+    let (_root, state) = direct_state(&base);
+    let (status, body) = request_stream(
+        state,
+        "/v1/messages",
+        r#"{"model":"gpt-4o","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("event: "))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ],
+        "{body}"
+    );
+    // 上游回显的真实模型名要盖掉请求名。
+    assert!(body.contains(r#""model":"gpt-5.6-sol""#), "{body}");
+    assert!(body.contains(r#""text":"llo""#), "{body}");
+    assert!(body.contains(r#""stop_reason":"end_turn""#), "{body}");
+    assert!(body.contains(r#""input_tokens":5"#), "{body}");
+    // Anthropic 流没有 [DONE]，客户端靠 message_stop 收尾。
+    assert!(!body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn messages_route_surfaces_a_truncated_stream_as_an_error_event() {
+    // 上游断在半路时补一个干净的 message_stop，会把截断的回复伪装成完整的。
+    // Anthropic SDK 认 `event: error` 并抛出，这才是如实的信号。
+    let base = mock_upstream(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+    )
+    .await;
+    let (_root, state) = direct_state(&base);
+    let (status, body) = request_stream(
+        state,
+        "/v1/messages",
+        r#"{"model":"gpt-4o","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(r#""text":"partial""#), "{body}");
+    assert_eq!(body.matches("event: error").count(), 1, "{body}");
+    // 错误是终结事件，不该再跟一个假装正常收尾的 message_stop。
+    assert_eq!(body.matches("event: message_stop").count(), 0, "{body}");
+}
+
+#[tokio::test]
+async fn messages_route_reports_upstream_errors_in_anthropic_shape() {
+    let base = response_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"message":"slow down","type":"rate_limit_error"}}).to_string(),
+    )
+    .await;
+    let (_root, state) = direct_state(&base);
+    let (status, body) = request_stream(
+        state,
+        "/v1/messages",
+        r#"{"model":"gpt-4o","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+
+    // 两边错误体形状一致，透传比翻译更不容易丢上游给出的原因。
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains("slow down"), "{body}");
+}

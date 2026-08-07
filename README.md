@@ -35,7 +35,14 @@ RUN_LIVE_ACP_TEST=1 bash test/test-codebuddy-p0.sh
 
 ## 🐳 Docker 快速开始（只要一个 key）
 
-默认走 `cc.freemodel.dev`：它讲 Anthropic Messages 协议，鉴权只看 `Bearer {FREEMODEL_API_KEY}`，**不需要登录，也不需要在宿主机装任何东西**。代理把客户端的 OpenAI 协议翻译过去再翻译回来，所以现有客户端不用改。
+默认走 `cc.freemodel.dev`：它讲 Anthropic Messages 协议，鉴权只看 `Bearer {FREEMODEL_API_KEY}`，**不需要登录，也不需要在宿主机装任何东西**。
+
+代理同时提供两种入站协议，客户端用哪种都行：
+
+| 端点 | 协议 | 适用客户端 |
+| --- | --- | --- |
+| `/v1/chat/completions` | OpenAI Chat Completions | Cursor、Codex、Continue、OpenCode… |
+| `/v1/messages` | Anthropic Messages | Claude Code、Anthropic SDK… |
 
 ```bash
 cp .env.example .env
@@ -70,9 +77,26 @@ docker run -d --name freemodel-proxy \
 
 镜像名全小写是 GHCR 的硬性要求，与仓库原名 `MurasameCyan/Ciallo_Freemodel_Proxy` 的大小写无关。
 
-客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试。
+客户端 Base URL 填 `http://127.0.0.1:40589/v1`，API key 填你的 `PROXY_API_KEY`（不是 Freemodel key）。Anthropic 客户端同样填这个地址，它会自己拼出 `/v1/messages`；Claude Code 用 `ANTHROPIC_BASE_URL=http://127.0.0.1:40589` 加 `ANTHROPIC_AUTH_TOKEN=$PROXY_API_KEY`。可用模型：`claude-opus-5`、`claude-fable-5`、`claude-haiku-4-5-20251001`。其它 Claude 别名会被上游静默改换，代理如实回显真实后端名，所以响应里的 `model` 可能与请求不同。上游共享容器池占满时返回 500，代理会自动沿这三个后端降级重试。
 
 每次响应都带 `usage`（含 `cached_tokens`），用它核对真实消耗。
+
+### 🧹 上游自带提示词与 `FREEMODEL_PROMPT_GUARD`
+
+cc 的每个后端都是一个 agent CLI 容器，上游在容器内部注入了自己的一整套 harness 提示词。实测结论要说清楚：
+
+- **它不能被客户端清除。** 注入发生在上游容器内，不在请求体里，因此没有任何字段可以关掉它。它也不计入 `usage`。
+- **客户端的 `system` 对行为有效，对身份无效。** 你的指令会被遵守，但问「你是谁」时后端仍可能自称 Kiro 或 Claude Code，按容器轮换。
+- **真正影响可用性的不是身份，而是工具幻觉。** harness 让模型以为自己有文件系统和 shell，于是把 `<function_calls>` / `<tool_call>` 这类标记和编造的工具结果当普通文本吐出来，客户端会当成正文显示。
+
+代理的处理是 `FREEMODEL_PROMPT_GUARD`（默认 `true`）：在**客户端 `system` 之后**追加两句陈述事实的话，压制上面那种幻觉——位置靠后才压得住更靠前的注入，同时客户端指令仍在它前面。按请求里有没有 `tools` 选用两种措辞：
+
+- 无 `tools`：`You have no tools, no filesystem access and no shell in this session. Never emit <function_calls>, <invoke>, <tool_call> or <function_response> markup as text, and never invent tool results. If a request would need tools, say so in plain text.`
+- 有 `tools`：`The only tools available are the ones declared in this request; you have no filesystem access and no shell beyond them. Invoke them through the structured tool-call mechanism only. Never emit <function_calls>, <invoke>, <tool_call> or <function_response> markup as text, and never invent tool results.`
+
+两种措辞都实测过 6/6 不再泄漏标记，且不影响合法的 `tool_use`。带工具的客户端不会被告知「你没有工具」，这一点是分开两句的原因。设 `FREEMODEL_PROMPT_GUARD=false` 可完全关闭，代理就一个字都不加。
+
+代理不做响应侧过滤：泄漏形态多变，靠关键词删文本会误伤正常内容。
 
 ### 备选：work.freemodel.dev
 
@@ -104,6 +128,8 @@ docker run -d --name freemodel-proxy \
 ## 🌟 Features
 
 - ⚡ **OpenAI Compatibility**: Emulates `/v1/chat/completions`, `/v1/models`, and `/v1/responses`.
+- 🅰️ **Anthropic Messages Inbound**: Serves `/v1/messages` for Anthropic-native clients, streaming included. On `cc_anthropic` it is a near pass-through, so `tools`, `tool_result`, images, `cache_control`, and `thinking` reach the upstream unchanged; other transports are bridged onto the OpenAI dispatch path.
+- 🧹 **Injected-Prompt Guard**: Appends two factual sentences after the client `system` to stop the upstream harness from emitting fake tool-call markup as text. Toggle with `FREEMODEL_PROMPT_GUARD`.
 - 💬 **Interactive Rust TUI**: Full-screen Ratatui workspace with guided setup, validated live streaming, session/model/project pickers, retry/edit/cancel controls, search, diagnostics, logs, preferences, and masked key setup.
 - 🔑 **Automatic Key Resolution**: Auto-detects and persists API keys locally in `config.json` or reads existing keys from `~/.codex/auth.json`.
 - 🔄 **Native Incremental Streaming**: Forwards direct HTTP and WorkBuddy ACP deltas immediately for both Chat Completions and Responses API clients.
@@ -122,7 +148,7 @@ docker run -d --name freemodel-proxy \
 
 The proxy supports three transports, and it picks one automatically from the `FREEMODEL_BASE_URL` host, so you normally do not set `FREEMODEL_TRANSPORT` at all:
 
-- `cc_anthropic` (auto for `cc.freemodel.dev`): Translates OpenAI Chat Completions to Anthropic Messages against `https://cc.freemodel.dev/v1/messages`. Auth is only `Bearer {FREEMODEL_API_KEY}` — no login, no local gateway, nothing installed on the host. On upstream HTTP 500 `Maximum number of running container instances exceeded` (shared container pool, unrelated to your quota) the proxy retries down `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001`; 4xx never retries. The real backend name is read from `message_start.model`, because upstream silently swaps models.
+- `cc_anthropic` (auto for `cc.freemodel.dev`): Translates OpenAI Chat Completions to Anthropic Messages against `https://cc.freemodel.dev/v1/messages`, and forwards inbound `/v1/messages` almost verbatim — only `model` is rewritten (plus the guard sentence when enabled), because the upstream already speaks Anthropic and any translation would drop `tools`, `tool_result`, images, `cache_control`, or `thinking`. Auth is only `Bearer {FREEMODEL_API_KEY}` — no login, no local gateway, nothing installed on the host. On upstream HTTP 500 `Maximum number of running container instances exceeded` (shared container pool, unrelated to your quota) the proxy retries down `claude-opus-5 → claude-fable-5 → claude-haiku-4-5-20251001`; 4xx never retries. The real backend name is read from `message_start.model`, because upstream silently swaps models.
 - `workbuddy_acp` (auto for `work.freemodel.dev`, and required there): Official WorkBuddy ACP for the logical WorkBuddy service at `https://work.freemodel.dev/v1`. The OpenAI-style service route is `https://work.freemodel.dev/v1/chat/completions`, but the proxy deliberately does **not** POST to that protected URL. It launches or discovers an authenticated local CodeBuddy ACP gateway and exchanges ACP messages through loopback `/api/v1/acp`.
 - `http` (auto for anything else): Direct OpenAI-compatible passthrough. Do not use this transport with `work.freemodel.dev`.
 
@@ -150,7 +176,8 @@ Optional ACP settings are `WORKBUDDY_ACP_TIMEOUT` and `WORKBUDDY_ACP_MAX_ATTEMPT
 - `PROXY_SIDECAR_STARTUP_TIMEOUT`: maximum sidecar startup wait.
 - `PROXY_SIDECAR_IDLE_TIMEOUT`: seconds before an inactive sidecar is stopped; its session metadata remains reusable.
 - `PROXY_MAX_HISTORY_TURNS`: number of user/assistant turn pairs retained for the TUI.
-- `PROXY_API_KEY`: optional Bearer key required by `/v1/models`, `/v1/chat/completions`, and `/v1/responses`. Loopback-only management and health routes remain available locally. When enabled, the proxy uses `FREEMODEL_API_KEY` for the direct upstream instead of forwarding the proxy credential.
+- `FREEMODEL_PROMPT_GUARD`: `true` by default. Appends the guard sentence described above after the client `system`. Accepts `1/0`, `true/false`, `yes/no`, `on/off`, or a real JSON boolean in `config.json`. Set it to `false` to send the client prompt untouched.
+- `PROXY_API_KEY`: optional Bearer key required by `/v1/models`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`. Loopback-only management and health routes remain available locally. When enabled, the proxy uses `FREEMODEL_API_KEY` for the direct upstream instead of forwarding the proxy credential.
 
 `cc_anthropic` ignores every `WORKBUDDY_*` and sidecar setting; it needs only `FREEMODEL_BASE_URL` and `FREEMODEL_API_KEY`. Its responses always carry `usage`, with cache reads folded into `prompt_tokens` and broken out under `prompt_tokens_details.cached_tokens`; streaming attaches them to the finish chunk. `/v1/models` reports only the three real cc backends on this transport.
 
@@ -306,8 +333,10 @@ The protected WorkBuddy ACP transport remains project-scoped—its sidecar and A
 | Capability | Direct HTTP (`http`) | WorkBuddy ACP (`workbuddy_acp`) | cc Anthropic (`cc_anthropic`) |
 | --- | --- | --- | --- |
 | `/v1/chat/completions` text, streaming and not | Yes | Yes | Yes |
+| `/v1/messages` text, streaming and not | Yes; bridged onto the OpenAI upstream | Yes; bridged onto ACP | Yes; near pass-through, highest fidelity |
 | `/v1/responses` text | Yes | Yes | No; returns an explicit `400` — use `/v1/chat/completions` |
-| Client function-tool loop | Yes | No; rejected explicitly | No; text only |
+| Client function-tool loop | Yes | No; rejected explicitly | `/v1/messages` yes, unmodified; `/v1/chat/completions` text only |
+| `/v1/messages` `tool_result` history | Flattened to text; the tool output survives, its structure does not | Flattened to text | Preserved unchanged |
 | Codex/WorkBuddy skills | Executed by the client through its function-tool loop; the proxy transports calls and results | Sidecar-internal skills may be available, but they are not exposed as a transparent client tool loop | Not applicable |
 | Vision/image input | HTTP(S) and `data:image/...` URLs | Not supported through the ACP text transport | No; multipart content is flattened to text |
 | Bare local image paths | No; the client must read/encode them | No | No |
