@@ -27,7 +27,8 @@ RUN useradd --create-home --uid 10001 freemodel \
     && chmod 755 /usr/local/bin/codebuddy-p0-entrypoint.sh
 USER freemodel
 WORKDIR /app
-ENV PROXY_HOST=0.0.0.0 \
+ENV HOME=/data/codebuddy-home \
+    PROXY_HOST=0.0.0.0 \
     PROXY_PORT=40589 \
     FREEMODEL_BASE_URL=https://work.freemodel.dev/v1 \
     FREEMODEL_TRANSPORT=workbuddy_acp \
