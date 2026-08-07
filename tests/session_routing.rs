@@ -1,0 +1,697 @@
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{State, connect_info::MockConnectInfo},
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use freemodel_workbuddy_proxy::{
+    config::Config,
+    server::{AppState, router},
+};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tempfile::tempdir;
+use tower::ServiceExt;
+
+fn state() -> (tempfile::TempDir, AppState, String) {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut env = HashMap::from([
+        ("HOME".into(), root.path().to_string_lossy().to_string()),
+        (
+            "FREEMODEL_BASE_URL".into(),
+            "https://work.freemodel.dev/v1".into(),
+        ),
+        ("FREEMODEL_TRANSPORT".into(), "workbuddy_acp".into()),
+        (
+            "PROXY_SESSION_STORE".into(),
+            root.path()
+                .join("sessions.json")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        (
+            "PROXY_RUNTIME_DIR".into(),
+            root.path().join("runtime").to_string_lossy().to_string(),
+        ),
+        (
+            "WORKBUDDY_CLI_PATH".into(),
+            root.path().join("missing").to_string_lossy().to_string(),
+        ),
+    ]);
+    env.insert(
+        "PROXY_DEFAULT_PROJECT".into(),
+        project.to_string_lossy().to_string(),
+    );
+    let config = Config::load_with_env(root.path(), &env).unwrap();
+    let state = AppState::new(config).unwrap();
+    (root, state, project.to_string_lossy().to_string())
+}
+#[tokio::test]
+async fn acp_rejects_function_tools_before_sidecar_resolution() {
+    let (_root, state, _project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let chat = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "messages":[{"role":"user","content":"hello"}],
+                        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(
+        chat.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("not supported by the WorkBuddy ACP transport"));
+
+    let responses = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "input":"hello",
+                        "stream":true,
+                        "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(responses.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(
+        responses
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("not supported by the WorkBuddy ACP transport"));
+}
+
+async fn external_gateway() -> (SocketAddr, Arc<Mutex<Option<String>>>) {
+    #[derive(Clone)]
+    struct GatewayState {
+        cwd: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn connect() -> impl IntoResponse {
+        (
+            [
+                ("content-type", "text/event-stream"),
+                ("acp-connection-id", "test-connection"),
+                ("acp-session-token", "test-token"),
+            ],
+            ":ok\n\n",
+        )
+    }
+
+    async fn rpc(State(state): State<GatewayState>, Json(body): Json<Value>) -> Response {
+        let id = body["id"].as_i64().unwrap();
+        let method = body["method"].as_str().unwrap();
+        let events = match method {
+            "initialize" => vec![json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}})],
+            "session/new" => {
+                *state.cwd.lock().unwrap() = body.pointer("/params/cwd").and_then(Value::as_str).map(str::to_string);
+                vec![json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"session-1"}})]
+            }
+            "session/prompt" => vec![
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OK"}}}}),
+                json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}),
+            ],
+            _ => vec![json!({"jsonrpc":"2.0","id":id,"error":{"message":"unknown method"}})],
+        };
+        let body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response()
+    }
+
+    async fn close() -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    let cwd = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/api/v1/health", get(|| async { StatusCode::OK }))
+        .route("/api/v1/acp", get(connect).post(rpc).delete(close))
+        .with_state(GatewayState { cwd: cwd.clone() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (address, cwd)
+}
+
+fn external_state(root: &tempfile::TempDir, address: SocketAddr, external_cwd: &str) -> AppState {
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let env = HashMap::from([
+        ("HOME".into(), root.path().to_string_lossy().to_string()),
+        (
+            "PROXY_DEFAULT_PROJECT".into(),
+            project.to_string_lossy().to_string(),
+        ),
+        ("WORKBUDDY_SIDECAR_MODE".into(), "external".into()),
+        ("WORKBUDDY_ACP_URL".into(), format!("http://{address}")),
+        ("WORKBUDDY_EXTERNAL_CWD".into(), external_cwd.into()),
+        ("WORKBUDDY_ACP_MAX_ATTEMPTS".into(), "1".into()),
+    ]);
+    AppState::new(Config::load_with_env(root.path(), &env).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn health_reports_external_official_gateway_mode() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let env = HashMap::from([
+        ("HOME".into(), root.path().to_string_lossy().to_string()),
+        (
+            "PROXY_DEFAULT_PROJECT".into(),
+            project.to_string_lossy().to_string(),
+        ),
+        ("WORKBUDDY_SIDECAR_MODE".into(), "external".into()),
+        (
+            "WORKBUDDY_ACP_URL".into(),
+            "http://host.docker.internal:44741".into(),
+        ),
+        (
+            "WORKBUDDY_EXTERNAL_CWD".into(),
+            "C:/Users/test/workspace".into(),
+        ),
+    ]);
+    let state = AppState::new(Config::load_with_env(root.path(), &env).unwrap()).unwrap();
+    let response = router(state)
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let health: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(health["upstream_mode"], "official_external_acp");
+}
+
+#[tokio::test]
+async fn external_acp_uses_gateway_visible_cwd() {
+    let root = tempdir().unwrap();
+    let (address, cwd) = external_gateway().await;
+    let state = external_state(&root, address, "C:/Users/test/workspace");
+    let response = router(state)
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "OK");
+    assert_eq!(cwd.lock().unwrap().as_deref(), Some("C:/Users/test/workspace"));
+}
+
+#[tokio::test]
+async fn readiness_checks_external_gateway() {
+    let root = tempdir().unwrap();
+    let (address, _cwd) = external_gateway().await;
+    let ready = router(external_state(&root, address, "C:/Users/test/workspace"))
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = listener.local_addr().unwrap();
+    drop(listener);
+    let failed = router(external_state(
+        &tempdir().unwrap(),
+        unavailable,
+        "C:/Users/test/workspace",
+    ))
+    .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn model_discovery_supports_openai_and_codex_schemas() {
+    let (_root, state, _project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let response = app
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["object"], "list");
+    assert!(body["data"].is_array());
+    assert!(body["models"].is_array());
+    assert_eq!(body["data"], body["models"]);
+    assert!(
+        body["models"]
+            .as_array()
+            .is_some_and(|models| !models.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn management_crud_and_validation() {
+    let (_root, state, project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/proxy/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"project":project,"title":"Test"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let session: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = session["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/proxy/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(
+            Request::delete(format!("/proxy/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+#[tokio::test]
+async fn health_exposes_current_build_identity() {
+    let (_root, state, _project) = state();
+    let response = router(state)
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(health["service"], "freemodel-proxy");
+    assert_eq!(health["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
+    assert_eq!(health["logical_service"], "https://work.freemodel.dev/v1");
+    assert_eq!(health["transport"], "workbuddy_acp");
+    assert_eq!(health["upstream_mode"], "official_managed_acp");
+    assert!(health.get("upstream").is_none());
+}
+
+#[tokio::test]
+async fn management_rename_clear_history_and_diagnostics() {
+    let (_root, state, project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/proxy/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"project":project,"title":"Before"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = session["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::patch(format!("/proxy/sessions/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"After"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let renamed: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(renamed["title"], "After");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/proxy/sessions/{id}/history"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"x"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/proxy/sessions/{id}/history"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"replacement"},{"role":"assistant","content":"ok"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replaced: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(replaced["history"].as_array().unwrap().len(), 2);
+    assert_eq!(replaced["history"][0]["content"], "replacement");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/proxy/sessions/{id}/history"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cleared: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(cleared["history"], json!([]));
+    let response = app
+        .oneshot(
+            Request::get("/proxy/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let diagnostics: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(diagnostics["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(diagnostics["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
+    assert_eq!(diagnostics["default_project"], project);
+    assert!(diagnostics["uptime_seconds"].as_u64().is_some());
+    assert!(diagnostics.get("active_sidecars").is_some());
+    assert_eq!(diagnostics["capabilities"]["responses_api"], true);
+    assert_eq!(diagnostics["capabilities"]["client_function_tools"], false);
+    assert_eq!(
+        diagnostics["capabilities"]["skills_execution"],
+        "sidecar_only_not_transparent"
+    );
+    assert_eq!(diagnostics["capabilities"]["vision_input"], "unsupported");
+    assert_eq!(diagnostics["capabilities"]["local_image_paths"], false);
+    assert_eq!(diagnostics["capabilities"]["image_generation"], false);
+}
+#[tokio::test]
+async fn management_rename_rejects_empty_title() {
+    let (_root, state, project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/proxy/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"project":project,"title":"Before"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = session["id"].as_str().unwrap();
+    let response = app
+        .oneshot(
+            Request::patch(format!("/proxy/sessions/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+#[tokio::test]
+async fn management_routes_reject_non_loopback_but_accept_ipv6_loopback() {
+    let (_root, state, _project) = state();
+    let denied = router(state.clone())
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [192, 0, 2, 10],
+            40000,
+        ))))
+        .oneshot(
+            Request::get("/proxy/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let allowed = router(state)
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            40000,
+        ))))
+        .oneshot(
+            Request::get("/proxy/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_local_origin_and_required_methods() {
+    let (_root, state, _project) = state();
+    for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+        let response = router(state.clone())
+            .layer(MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                40000,
+            ))))
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/proxy/sessions")
+                    .header("origin", "http://127.0.0.1")
+                    .header("access-control-request-method", method)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1")
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_does_not_approve_unlisted_origin() {
+    let (_root, state, _project) = state();
+    let response = router(state)
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/proxy/sessions")
+                .header("origin", "https://attacker.example")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn explicit_session_project_mismatch_fails_before_sidecar() {
+    let (_root, state, project) = state();
+    let other = std::path::Path::new(&project)
+        .parent()
+        .unwrap()
+        .join("other");
+    std::fs::create_dir(&other).unwrap();
+    let session = state
+        .store
+        .create(&project, "Test", Some("proxy-routing1"), false)
+        .await
+        .unwrap();
+    let response = router(state)
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-workbuddy-session", session.id)
+                .header("x-workbuddy-project", other.to_string_lossy().as_ref())
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"x"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn malformed_management_bodies_return_client_errors() {
+    let (_root, state, project) = state();
+    let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        40000,
+    ))));
+    let invalid_create = app
+        .clone()
+        .oneshot(
+            Request::post("/proxy/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("[]"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_create.status(), StatusCode::BAD_REQUEST);
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post("/proxy/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"project":project}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session: Value =
+        serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = session["id"].as_str().unwrap();
+    for method in ["POST", "PUT"] {
+        let invalid_history = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("/proxy/sessions/{id}/history"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"messages":"not-an-array"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_history.status(),
+            StatusCode::BAD_REQUEST,
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_explicit_session_fails_before_sidecar() {
+    let (_root, state, project) = state();
+    let response = router(state)
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-workbuddy-session", "proxy-unknown1")
+                .header("x-workbuddy-project", project)
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"x"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

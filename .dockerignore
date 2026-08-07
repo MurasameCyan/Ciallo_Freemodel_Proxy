@@ -1,0 +1,51 @@
+# 注意：不要忽略 tests/ —— Cargo.toml 的 [[bin]] fake-codebuddy 指向
+# tests/fixtures/fake_codebuddy.rs，cargo 校验 manifest 时要求该文件存在。
+
+.git
+.github
+.gitignore
+
+# 构建产物
+target/
+
+# 文档（不影响构建）
+*.md
+LICENSE
+
+# 密钥与本地配置：绝不进镜像
+config.json
+config.local.json
+.env
+.env.*
+key.txt
+keys*.json
+*.pem
+*.key
+
+# 运行时状态
+.proxy-sessions.json
+.proxy-sessions.lock
+.proxy-runtime/
+*.log
+
+# 遗留 Python 实现与 Python/Docker 测试（Rust 镜像不需要）
+# test/ 与 tests/ 是不同目录：这里只排除 test/，Rust 的 tests/ 必须保留。
+test/
+**/*.py
+__pycache__/
+.pytest_cache/
+venv/
+.venv/
+
+# Docker 自身
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,14 @@
+# 仓库内统一按 LF 存储，交由各平台在检出时决定换行符。
+* text=auto
+
+# 这些文件在 Linux 容器 / CI 里执行，必须是 LF。
+# 带 CRLF 的 shell 脚本会报 "bad interpreter: /bin/bash^M"。
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Rust / Python 源码同样固定 LF，避免跨平台 diff 噪音。
+*.rs text eol=lf
+*.py text eol=lf
