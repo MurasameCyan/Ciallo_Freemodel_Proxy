@@ -85,6 +85,8 @@ docker run -d --name freemodel-proxy \
 
 每次响应都带 `usage`（含 `cached_tokens`），用它核对真实消耗。
 
+如果 Dify、OpenWebUI、n8n 之类的编排工具也在 Docker 里跑，可以让它们和代理共处一个外部网络，用 `http://freemodel-proxy:40589` 直接互访，代理不必暴露到宿主机。`docker-compose.yml` 里已备好这两段注释，取消注释并先 `docker network create` 即可，详见 [DOCKER.md](DOCKER.md#加入已有的外部网络容器间调用)。
+
 ### 🧹 上游自带提示词与 `FREEMODEL_PROMPT_GUARD`
 
 cc 的每个后端都是一个 agent CLI 容器，上游在容器内部注入了自己的一整套 harness 提示词。实测结论要说清楚：

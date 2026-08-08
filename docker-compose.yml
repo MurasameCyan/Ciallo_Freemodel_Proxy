@@ -27,6 +27,18 @@ services:
       - proxy-data:/data
       # 供客户端访问的工作目录，对应 PROXY_DEFAULT_PROJECT。
       - ./workspace:/workspace
+    # 加入一个已存在的外部网络，让同网络的其他容器用 http://freemodel-proxy:40589
+    # 直接调用，不必经宿主机端口。适合把 Dify、OpenWebUI 之类的编排放在同一网络里：
+    # 上面的 ports 可以一起注释掉，代理就完全不暴露到宿主机。
+    # 注意容器内始终监听 0.0.0.0，同网络的容器都能访问，PROXY_API_KEY 仍然必填。
+    # networks:
+    #   - ai-internal
 
 volumes:
   proxy-data:
+
+# external: true 表示这个网络由外部创建、compose 不负责建也不负责删。
+# 启用前先建好：docker network create ai-internal
+# networks:
+#   ai-internal:
+#     external: true

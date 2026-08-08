@@ -294,6 +294,41 @@ PROXY_API_KEY=强随机值
 
 并把 `PROXY_BIND` 改为 `0.0.0.0`。此时 `PROXY_API_KEY` 不是可选项，而是启动条件：镜像绑 `0.0.0.0`，没设它代理会直接拒绝启动并说明原因。这一条由代码强制，不靠你记得——空 key 在代码里等于关闭鉴权，而代理持有你的上游 key，无鉴权暴露等于把额度和 `/setup/key` 的写入权限交给所有能连上的人。必须同时配置防火墙，不要暴露到公网。
 
+## 加入已有的外部网络（容器间调用）
+
+如果 Dify、OpenWebUI、n8n 之类的编排工具也跑在 Docker 里，让它们和代理共处一个网络比经宿主机端口更直接：容器间用服务名互访，代理可以完全不暴露到宿主机。
+
+`docker-compose.yml` 里已经写好这两段，默认注释掉，取消注释即可：
+
+```yaml
+services:
+  freemodel-proxy:
+    networks:
+      - ai-internal
+
+networks:
+  ai-internal:
+    external: true
+```
+
+`external: true` 表示这个网络由外部创建，compose 既不负责建、也不负责删。所以要先建好，否则启动时会报 `network ai-internal declared as external, but could not be found`：
+
+```bash
+docker network create ai-internal
+docker compose up -d
+```
+
+同网络的其他容器改用服务名调用，端口是容器内的 40589，不是宿主机映射的那个：
+
+```
+http://freemodel-proxy:40589/v1            # OpenAI 客户端
+http://freemodel-proxy:40589               # Anthropic 客户端
+```
+
+启用后可以把 `ports` 一起注释掉，代理就只在这个网络里可达。**但 `PROXY_API_KEY` 仍然必填**：容器内始终监听 `0.0.0.0`，同网络的任何容器都能直连，启动闸门也照样拦。这个网络只是缩小了暴露面，不等于内网可信——`/setup` 页面和 `/setup/key` 写入接口对同网络容器一样可达。
+
+网络名不必叫 `ai-internal`，改成你已有的那个即可，两处要一致。已有网络的名字用 `docker network ls` 查；注意 compose 自己创建的网络会带项目名前缀（如 `myproject_default`），要填那个完整名字。
+
 ## direct HTTP 回退模式
 
 如果只想使用计费/限额的 `api.freemodel.dev`，可在 `.env` 设置：
@@ -342,6 +377,32 @@ docker buildx imagetools inspect ghcr.io/murasamecyan/ciallo_freemodel_proxy:lat
 ```
 
 应当能看到 `linux/amd64` 与 `linux/arm64` 两条。急用又不想等的话，`docker compose build` 在本机直接编，出来的就是本机架构。
+
+### `network ai-internal declared as external, but could not be found`
+
+取消了 `networks` 注释但没先建网络。`external: true` 意味着 compose 不负责创建它：
+
+```bash
+docker network create ai-internal
+docker compose up -d
+```
+
+要挂到已有网络就用 `docker network ls` 查出真名填进去，两处（服务下和顶层）必须一致。compose 自建的网络带项目名前缀，例如 `dify_default`。详见[加入已有的外部网络](#加入已有的外部网络容器间调用)。
+
+### 同网络的容器连不上 `http://freemodel-proxy:40589`
+
+按顺序排掉这几种：
+
+- 两个容器不在同一个网络。`docker inspect -f '{{json .NetworkSettings.Networks}}' freemodel-proxy` 看代理实际加入了哪些网络，对方容器同样查一次，取交集。
+- 端口写错。服务名走的是容器内端口 `40589`，与 `PROXY_HOST_PORT` 的宿主机映射无关，改了后者不影响这里。
+- 主机名写错。用的是 compose 里的服务名 `freemodel-proxy`，不是 `container_name`（本项目两者同名，改过其中一个就会不一致）。
+- 漏了鉴权头。容器间调用一样要带 `Authorization: Bearer <PROXY_API_KEY>`，同网络不等于免鉴权。
+
+在对方容器里直接验：
+
+```bash
+docker exec -it <对方容器> curl -s http://freemodel-proxy:40589/health
+```
 
 ### cc 路线返回 401 `Invalid token`
 
